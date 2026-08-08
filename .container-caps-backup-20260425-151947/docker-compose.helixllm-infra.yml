@@ -60,7 +60,7 @@ services:
 
   # HelixLLM Kafka for messaging
   helixllm-kafka:
-    image: bitnami/kafka:latest
+    image: soldevelo/kafka:latest
     container_name: helixagent-helixllm-kafka
     ports:
       - "${HELIX_LLM_KAFKA_PORT:-9093}:9092"
