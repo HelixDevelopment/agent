@@ -215,17 +215,27 @@ func TestProvider_GetCapabilities(t *testing.T) {
 	require.NotNil(t, caps)
 	assert.Equal(t, "helixllm", caps.Metadata["provider_name"])
 	assert.True(t, caps.SupportsStreaming)
-	assert.True(t, caps.SupportsFunctionCalling)
-	assert.True(t, caps.SupportsTools)
-	assert.True(t, caps.SupportsReasoning)
-	assert.True(t, caps.SupportsCodeCompletion)
-	assert.True(t, caps.SupportsCodeAnalysis)
-	assert.True(t, caps.SupportsRefactoring)
 	assert.False(t, caps.SupportsVision)
 	assert.False(t, caps.SupportsSearch)
+	// HA-F2-004 reconciliation (§11.4.120): the fix removed capability flags
+	// no code path evidences. The old assertions below encoded the defect —
+	// they now assert the new honest mechanism explicitly.
+	assert.False(t, caps.SupportsTools,
+		"ChatCompletionRequest has no Tools field — no code path evidences tool support")
+	assert.False(t, caps.SupportsFunctionCalling)
+	assert.False(t, caps.SupportsReasoning)
+	assert.False(t, caps.SupportsCodeCompletion)
+	assert.False(t, caps.SupportsCodeAnalysis)
+	assert.False(t, caps.SupportsRefactoring)
 	assert.Contains(t, caps.SupportedFeatures, "streaming")
-	assert.Contains(t, caps.SupportedFeatures, "embeddings")
-	assert.Contains(t, caps.SupportedFeatures, "function_calling")
+	assert.NotContains(t, caps.SupportedFeatures, "embeddings",
+		"the embeddings endpoint constant has no calling method — unevidenced")
+	assert.NotContains(t, caps.SupportedFeatures, "function_calling")
+	// The default endpoint (https://localhost:8443) has no serving layer in
+	// this test, so the live listing fails closed to honest-empty.
+	assert.Empty(t, caps.SupportedModels)
+	assert.NotContains(t, caps.SupportedModels, "helixllm-default",
+		"the request-default model id must never surface as a supported model")
 }
 
 func TestProvider_ValidateConfig(t *testing.T) {

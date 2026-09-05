@@ -68,6 +68,13 @@ const (
 	embeddingsEndpoint = "/v1/embeddings"
 	modelsEndpoint     = "/v1/models"
 	healthEndpoint     = "/internal/health"
+
+	// modelsCacheTTL bounds how long a live /v1/models listing is reused
+	// before it is re-fetched (CONST-038 freshness window).
+	modelsCacheTTL = 30 * time.Second
+	// modelsListTimeout bounds a single listing call so a slow or hung
+	// serving layer can never stall capability reporting (HA-F2-004).
+	modelsListTimeout = 2 * time.Second
 )
 
 // normalizeBase makes an OpenAI-compatible BASE URL safe to concatenate with
@@ -158,6 +165,13 @@ type Provider struct {
 	initialized bool
 	initErr     error
 	initOnce    sync.Once
+
+	// Live model listing cache (HA-F2-004). modelsMu serialises fetch+read;
+	// modelsCache/modelsFetched hold the last successful GET /v1/models
+	// result and are reused only within modelsCacheTTL.
+	modelsMu      sync.Mutex
+	modelsCache   []string
+	modelsFetched time.Time
 }
 
 // Config holds configuration for the HelixLLM provider
@@ -440,15 +454,98 @@ func (p *Provider) HealthCheck() error {
 	return nil
 }
 
-// GetCapabilities implements the LLMProvider interface
+// GetModels performs a live, bounded GET /v1/models against the provider's
+// endpoint and returns the ids the serving layer actually reports, in server
+// order. It is the sole source for SupportedModels (HA-F2-004, CONST-036):
+// nothing here invents a model id. On any failure (unreachable, non-200,
+// malformed body) it returns the error and the empty list — capabilities
+// fail CLOSED, never to a fabricated placeholder.
+func (p *Provider) GetModels(ctx context.Context) ([]string, error) {
+	if err := p.initialize(); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint+modelsEndpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create models request: %w", err)
+	}
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	}
+
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list models: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list models returned status %d", resp.StatusCode)
+	}
+
+	var list struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return nil, fmt.Errorf("decode models list: %w", err)
+	}
+
+	ids := make([]string, 0, len(list.Data))
+	for _, m := range list.Data {
+		if m.ID != "" {
+			ids = append(ids, m.ID)
+		}
+	}
+	return ids, nil
+}
+
+// servedModels returns the cached live listing, refreshing it when the cache
+// is empty or older than modelsCacheTTL. A failed refresh keeps the last
+// good listing for its TTL (bounded staleness per CONST-038); a provider
+// that never listed successfully yields an honest-empty slice — never the
+// placeholder defaultModel as a "supported" claim.
+//
+// modelsMu is held across the fetch; GetModels does not re-acquire it, so
+// there is no deadlock, and the per-call timeout caps the hold at
+// modelsListTimeout.
+func (p *Provider) servedModels() []string {
+	p.modelsMu.Lock()
+	defer p.modelsMu.Unlock()
+
+	if !p.modelsFetched.IsZero() && time.Since(p.modelsFetched) < modelsCacheTTL {
+		return p.modelsCache
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), modelsListTimeout)
+	defer cancel()
+	ids, err := p.GetModels(ctx)
+	if err == nil {
+		p.modelsCache = ids
+		p.modelsFetched = time.Now()
+	}
+	return p.modelsCache
+}
+
+// GetCapabilities implements the LLMProvider interface.
+//
+// HA-F2-004 (CONST-036/CONST-040 class): SupportedModels comes ONLY from the
+// live serving layer via servedModels. Capability flags carry only what this
+// provider's code evidences: SupportsStreaming is backed by the real
+// CompleteStream implementation. Flags with no serving-layer or code
+// evidence here (tools/function-calling — ChatCompletionRequest has no Tools
+// field; reasoning; code completion/analysis/refactoring; embeddings — the
+// endpoint constant has no calling method) are reported FALSE/absent rather
+// than asserted true.
 func (p *Provider) GetCapabilities() *models.ProviderCapabilities {
 	return &models.ProviderCapabilities{
-		SupportedModels:         []string{p.model},
-		SupportedFeatures:       []string{"streaming", "embeddings", "function_calling"},
-		SupportedRequestTypes:   []string{"chat", "completion"},
-		SupportsStreaming:       true,
-		SupportsFunctionCalling: true,
-		SupportsVision:          false,
+		SupportedModels:       p.servedModels(),
+		SupportedFeatures:     []string{"streaming"},
+		SupportedRequestTypes: []string{"chat", "completion"},
+		SupportsStreaming:     true,
+		SupportsVision:        false,
 		Limits: models.ModelLimits{
 			MaxTokens:             8192,
 			MaxInputLength:        4096,
@@ -459,12 +556,7 @@ func (p *Provider) GetCapabilities() *models.ProviderCapabilities {
 			"provider_name": "helixllm",
 			"default_model": p.model,
 		},
-		SupportsTools:          true,
-		SupportsSearch:         false,
-		SupportsReasoning:      true,
-		SupportsCodeCompletion: true,
-		SupportsCodeAnalysis:   true,
-		SupportsRefactoring:    true,
+		SupportsSearch: false,
 	}
 }
 
