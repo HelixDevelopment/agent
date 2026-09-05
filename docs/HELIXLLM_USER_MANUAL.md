@@ -92,8 +92,13 @@ nano .env
 
 Add these settings:
 ```bash
-# Enable HelixLLM
+# HelixLLM is ON by default since the local-first default (HA-F2-002) —
+# this line is only needed to make the opt-in explicit or to document intent.
 USE_HELIX_LLM=true
+
+# Cloud provider auto-discovery is OFF by default — opt in only if you
+# want env-credentialed cloud providers and the anonymous zen endpoint:
+# HELIX_CLOUD_PROVIDERS=true
 
 # HelixLLM Configuration
 HELIX_LLM_ENDPOINT=https://localhost:8443
@@ -117,7 +122,8 @@ HELIX_LLM_USE_HELIXAGENT_MEMORY=true
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `USE_HELIX_LLM` | `true` | Enable HelixLLM integration |
+| `USE_HELIX_LLM` | `true` (local-first default, HA-F2-002) | Local HelixLLM/llama.cpp chain. Default ON; set to an explicit `false`/`0`/`no`/`off` to opt OUT |
+| `HELIX_CLOUD_PROVIDERS` | `false` | Cloud provider auto-discovery (env-credentialed cloud providers + anonymous zen). Default OFF; set to `true`/`1`/`yes`/`on` to opt IN |
 | `HELIX_LLM_ENDPOINT` | `https://localhost:8443` | HelixLLM API endpoint |
 | `HELIX_LLM_API_KEY` | - | API key (if required) |
 | `HELIX_LLM_TLS_SKIP_VERIFY` | `false` | Skip TLS verification (secure-by-default; set `true` only for local dev against self-signed certs) |

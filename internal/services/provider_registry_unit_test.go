@@ -148,6 +148,11 @@ func TestProviderRegistryUnit_NewProviderRegistry_WithAutoDiscovery(t *testing.T
 	// milliseconds.
 	clearProviderEnvVarsForTest(t)
 
+	// HA-F2-002: cloud auto-discovery is default-OFF; this test exercises
+	// the discovery-enabled path, so opt in explicitly. The property under
+	// test (the code path executes and returns fast against a clean env) is
+	// unchanged.
+	t.Setenv("HELIX_CLOUD_PROVIDERS", "true")
 	cfg := &RegistryConfig{
 		DefaultTimeout:       30 * time.Second,
 		MaxRetries:           3,

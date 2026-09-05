@@ -1675,7 +1675,7 @@ func SetupRouterWithContext(cfg *config.Config) *RouterContext {
 // a fixed id here would put `helixllm/<id>` in front of users whether or not
 // anything was serving it (BLUFF-002, CONST-036).
 func newCatalogOptions(providerRegistry *services.ProviderRegistry, logger *logrus.Logger) catalog.Options {
-	helixLLMEnabled := os.Getenv("USE_HELIX_LLM") == "true"
+	helixLLMEnabled := services.HelixLLMEnabledDefault() // local-first default: ON unless explicit false (HA-F2-002)
 
 	opts := catalog.Options{
 		Providers:       catalog.NewRegistryProviderSource(providerRegistry),

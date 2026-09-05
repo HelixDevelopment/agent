@@ -2682,7 +2682,7 @@ func (h *UnifiedHandler) processWithDirectProvider(
 	}
 
 	// Try HelixLLM first when configured as primary local inference
-	if os.Getenv("USE_HELIX_LLM") == "true" {
+	if services.HelixLLMEnabledDefault() { // local-first default: ON unless explicit false (HA-F2-002)
 		provider, err := h.providerRegistry.GetProvider(PrimaryProviderName)
 		if err == nil {
 			response, provErr := provider.Complete(ctx, req)
@@ -2748,7 +2748,7 @@ func (h *UnifiedHandler) processWithDirectProviderStream(
 	}
 
 	// Try HelixLLM first when configured as primary local inference
-	if os.Getenv("USE_HELIX_LLM") == "true" {
+	if services.HelixLLMEnabledDefault() { // local-first default: ON unless explicit false (HA-F2-002)
 		provider, err := h.providerRegistry.GetProvider(PrimaryProviderName)
 		if err == nil {
 			streamChan, provErr := provider.CompleteStream(ctx, req)

@@ -603,8 +603,11 @@ func (sv *StartupVerifier) discoverOAuthProviders(ctx context.Context) []*Provid
 		}
 	}
 
-	// HelixLLM discovery (self-hosted via llama.cpp) — in main discoverProviders
-	if os.Getenv("USE_HELIX_LLM") == "true" {
+	// HelixLLM discovery (self-hosted via llama.cpp) — in main discoverProviders.
+	// Local-first default (HA-F2-002): ON unless USE_HELIX_LLM is an explicit
+	// false. Mirrors services.HelixLLMEnabledDefault(); the local helper is
+	// used here because services imports verifier (import cycle).
+	if getEnvBoolVerifier("USE_HELIX_LLM", true) {
 		helixLLMURL := os.Getenv("HELIX_LLM_ENDPOINT")
 		if helixLLMURL == "" {
 			helixLLMURL = "https://localhost:8443"

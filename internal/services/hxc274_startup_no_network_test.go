@@ -10,7 +10,9 @@ package services
 // to be present in the process environment. The call chain:
 //
 //	NewProviderRegistry
-//	  -> newProviderRegistry (autoDiscovery defaults true)
+//	  -> newProviderRegistry (autoDiscovery defaults true — since HA-F2-002
+//	     it requires an explicit HELIX_CLOUD_PROVIDERS=true opt-in; the
+//	     tests below set that env var before exercising the path)
 //	    -> initAutoDiscovery
 //	      -> ProviderDiscovery.DiscoverProviders()          [pre-fix]
 //	        -> (for every discovered provider) provider.GetCapabilities()
@@ -228,12 +230,19 @@ func TestHXC274_RegistryConstructionNeverPopulatesCapabilities(t *testing.T) {
 	hxc274HermeticEnv(t)
 
 	cfg := LoadRegistryConfigFromAppConfig(nil)
+	// HA-F2-002 (operator decision 2026-09-05): cloud auto-discovery is
+	// default-OFF and requires an explicit HELIX_CLOUD_PROVIDERS opt-in.
+	// This test targets the construction path that runs when discovery IS
+	// enabled, so it opts in explicitly — the HXC-274 property under test
+	// (construction never populates Capabilities) is unchanged.
+	t.Setenv("HELIX_CLOUD_PROVIDERS", "true")
 	reg := NewProviderRegistry(cfg, nil)
 
 	disc := reg.GetDiscovery()
-	require.NotNil(t, disc, "auto-discovery should still be enabled by default; if this "+
-		"is nil, NewProviderRegistry stopped discovering providers at all, which is a "+
-		"different (and worse) regression than HXC-274")
+	require.NotNil(t, disc, "auto-discovery, when explicitly opted in via HELIX_CLOUD_PROVIDERS=true, "+
+		"must still construct a discovery handle; if this is nil even with the opt-in, "+
+		"NewProviderRegistry stopped discovering providers at all, which is a different "+
+		"(and worse) regression than HXC-274")
 
 	zen := disc.GetProviderByName("zen")
 	require.NotNil(t, zen, "zen is discovered unconditionally regardless of credentials; "+

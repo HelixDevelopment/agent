@@ -323,7 +323,12 @@ func (cbp *circuitBreakerProvider) updateMetrics() {
 }
 
 func NewProviderRegistry(cfg *RegistryConfig, memory *MemoryService) *ProviderRegistry {
-	enableAutoDiscovery := true
+	// Local-first default (spec 002, HA-F2-002): cloud provider auto-discovery
+	// is OFF unless the operator explicitly opted in via
+	// HELIX_CLOUD_PROVIDERS=true. Previously this defaulted ON, which made
+	// every env-credentialed cloud provider (and the credential-less anonymous
+	// zen endpoint) reachable with zero operator action.
+	enableAutoDiscovery := CloudProvidersOptedIn()
 	if cfg != nil && cfg.DisableAutoDiscovery {
 		enableAutoDiscovery = false
 	}
@@ -779,13 +784,15 @@ func (r *ProviderRegistry) registerDefaultProviders(cfg *RegistryConfig) {
 	}
 	r.storeProviderConfig(geminiConfig)
 
-	// HelixLLM provider (submodule)
+	// HelixLLM provider (submodule) — the LOCAL llama.cpp/Colibri chain.
+	// Local-first default (spec 002, HA-F2-002): enabled unless the operator
+	// explicitly opted out via USE_HELIX_LLM=false.
 	helixllmConfig := cfg.Providers["helixllm"]
 	if helixllmConfig == nil {
 		helixllmConfig = &ProviderConfig{
 			Name:    "helixllm",
 			Type:    "helixllm",
-			Enabled: os.Getenv("USE_HELIX_LLM") == "true",
+			Enabled: HelixLLMEnabledDefault(),
 			Models: []ModelConfig{{
 				ID:      "helixllm-default",
 				Name:    "HelixLLM Default",
@@ -1688,7 +1695,7 @@ func (r *ProviderRegistry) createProviderFromConfig(cfg ProviderConfig) (llm.LLM
 			}).Info("Created HelixLLM provider")
 			return provider, nil
 		}
-		return nil, fmt.Errorf("HelixLLM provider not available: disabled (set USE_HELIX_LLM=true to enable)")
+		return nil, fmt.Errorf("HelixLLM provider not available: disabled via USE_HELIX_LLM=false (the local chain is on by default; unset USE_HELIX_LLM or set it to any value other than an explicit false to re-enable)")
 
 	case "qwen":
 		// Try API key first (direct API access), then ACP, then CLI proxy for OAuth
