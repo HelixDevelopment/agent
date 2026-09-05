@@ -28,10 +28,10 @@ func newCatalogForFacadeTest(opts ...catalog.HelixLLMOption) *catalog.CatalogSer
 func TestModelsFacade_ServingBackendMakesSelectorsUsable(t *testing.T) {
 	h := NewUnifiedHandler(nil, nil)
 	h.SetCatalogService(newCatalogForFacadeTest(catalog.HelixLLMOption{
-		ID:           "coder-7b",
+		ID:            "coder-7b",
 		ModelIdentity: "helixllm/localhost/coder-7b",
-		Host:         "localhost",
-		Availability: catalog.AvailabilityServing,
+		Host:          "localhost",
+		Availability:  catalog.AvailabilityServing,
 	}))
 
 	data := callUnifiedModels(t, h)

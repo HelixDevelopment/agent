@@ -38,10 +38,10 @@ import (
 const (
 	PrimaryProviderName = "helixllm"
 
-	ModelHelixLLM         = "helix-llm"
-	ModelHelixDebate      = "helix-debate"
-	ModelHelixAgentDebate = "helixagent-debate"
-	ModelHelixAgentLLM    = "helixagent-llm"
+	ModelHelixLLM           = "helix-llm"
+	ModelHelixDebate        = "helix-debate"
+	ModelHelixAgentDebate   = "helixagent-debate"
+	ModelHelixAgentLLM      = "helixagent-llm"
 	ModelHelixAgentEnsemble = "helixagent-ensemble"
 )
 
