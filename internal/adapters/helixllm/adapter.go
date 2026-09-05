@@ -52,9 +52,13 @@ func NewAdapter(cfg Config) (*Adapter, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = defaultTimeout
 	}
-	if !cfg.Enabled {
-		cfg.Enabled = getEnvBool("USE_HELIX_LLM", true)
-	}
+	// HA-F2-003: Enabled is caller-stated intent — there is deliberately NO
+	// env fallback here. A zero Config means "not requested", not "enable
+	// because USE_HELIX_LLM is unset". The local-first default
+	// (services.HelixLLMEnabledDefault) is applied by the wiring layer that
+	// decides whether to construct this adapter at all (router.go passes
+	// Enabled: true explicitly); an adapter that exists is one the wiring
+	// decided to create.
 
 	// Secure-by-default: match the behaviour already implemented in
 	// internal/llm/providers/helixllm/provider.go and documented in
