@@ -850,6 +850,11 @@ func SetupRouterWithContext(cfg *config.Config) *RouterContext {
 			catalogSvc := catalog.New(newCatalogOptions(providerRegistry, logger))
 			catalogHandler := catalog.NewHandler(catalogSvc)
 			protected.GET("/catalog", catalogHandler.List)
+			// HA-F2-001 (FR-019): the /v1/models facade annotates
+			// pseudo-model usability and appends the serving layer's own
+			// options from this same built catalog, so the wire-visible
+			// listing reflects real serving evidence.
+			unifiedHandler.SetCatalogService(catalogSvc)
 		}
 
 		// Provider management endpoints

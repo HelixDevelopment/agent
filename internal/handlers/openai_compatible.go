@@ -15,6 +15,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 
+	"dev.helix.agent/internal/catalog"
 	"dev.helix.agent/internal/config"
 	"dev.helix.agent/internal/llm"
 	"dev.helix.agent/internal/models"
@@ -40,6 +41,8 @@ const (
 	ModelHelixLLM         = "helix-llm"
 	ModelHelixDebate      = "helix-debate"
 	ModelHelixAgentDebate = "helixagent-debate"
+	ModelHelixAgentLLM    = "helixagent-llm"
+	ModelHelixAgentEnsemble = "helixagent-ensemble"
 )
 
 // UnifiedHandler provides 100% OpenAI-compatible API with automatic ensemble support
@@ -55,6 +58,11 @@ type UnifiedHandler struct {
 	debateService           *services.DebateService
 	showDebateDialogue      bool
 	reportGenerator         *services.VerificationReportGenerator
+	// catalogService, when wired (router.go), is the built catalog the
+	// /v1/models facade annotates availability from (HA-F2-001, FR-019).
+	// Nil means "no serving evidence wired" — the facade then reports
+	// "unreported" and withholds dispatch rather than claiming usability.
+	catalogService *catalog.CatalogService
 }
 
 // NewUnifiedHandler creates a new unified handler
@@ -106,6 +114,15 @@ func (h *UnifiedHandler) SetDebateTeamConfig(teamConfig *services.DebateTeamConf
 func (h *UnifiedHandler) SetSkillsIntegration(integration *skills.Integration) {
 	h.skillsIntegration = integration
 	logrus.WithField("integration_set", integration != nil).Info("Skills integration set")
+}
+
+// SetCatalogService wires the built catalog so the /v1/models facade can
+// annotate pseudo-model usability and the serving layer's own options from
+// real serving evidence (HA-F2-001, FR-019). A nil or unwired catalog is
+// the honest "unreported" state — the facade withholds dispatch claims.
+func (h *UnifiedHandler) SetCatalogService(svc *catalog.CatalogService) {
+	h.catalogService = svc
+	logrus.WithField("catalog_wired", svc != nil).Info("Catalog service set on unified handler")
 }
 
 func (h *UnifiedHandler) SetIntentBasedRouter(router *services.IntentBasedRouter) {
@@ -226,6 +243,14 @@ type OpenAIModel struct {
 	Permission []OpenAIModelPermission `json:"permission"`
 	Root       string                  `json:"root"`
 	Parent     *string                 `json:"parent"`
+	// Availability / WithheldReason (FR-019, HA-F2-001) annotate the entry
+	// with the serving layer's reported state: "serving", "withheld"
+	// (+ withheld_reason) or "unreported". A usable entry carries NO
+	// availability field — the permission block is its claim — so the
+	// field never overstates. omitempty keeps the annotation off the wire
+	// when absent.
+	Availability   string `json:"availability,omitempty"`
+	WithheldReason string `json:"withheld_reason,omitempty"`
 }
 
 // OpenAIModelPermission represents model permissions in OpenAI format
@@ -2287,25 +2312,43 @@ func (h *UnifiedHandler) CompletionsStream(c *gin.Context) {
 // HelixAgent exposes a single unified model that internally uses AI debate ensemble
 // Backend provider models are implementation details and not exposed to clients
 func (h *UnifiedHandler) Models(c *gin.Context) {
-	// HelixAgent exposes the model IDs that CLI agent configs
-	// (OpenCode, Crush, HelixCode) and SDK consumers reference:
-	//   - helixagent-debate:    AI debate ensemble (canonical name)
-	//   - helixagent-ensemble:  same ensemble, semantic alias surfacing
-	//                           the user-visible "ensemble" terminology
-	//   - helix-debate:         legacy alias used by HelixCode config
-	//   - helix-llm:            provider chain with HelixLLM-first fallback;
-	//                           used by OpenCode/HelixCode for "fast" routing
-	//   - helixagent-llm:       canonical name for the provider chain
-	//
-	// All are listed so CLI agents that pre-validate against /v1/models
-	// (instead of just sending the request) see them as available.
-	// Reproduction guards:
-	//   - challenges/scripts/opencode_helixllm_hello_challenge.sh
-	//     asserts helix-llm is present (CONST-032).
-	//   - challenges/scripts/chat_model_selection_challenge.sh
-	//     asserts helixagent-ensemble is dispatchable (CONST-035).
+	// HA-F2-001 (FR-019): the ids below are dispatch selectors, NOT served
+	// models. They may advertise sampling/dispatch ONLY when the wired
+	// catalog confirms a serving backend behind them:
+	//   - debate ids (helixagent-debate / helixagent-ensemble / helix-debate)
+	//     require ANY serving model — an ensemble with nothing to ensemble
+	//     is a bluff;
+	//   - llm-chain ids (helixagent-llm / helix-llm) require a serving
+	//     helixllm/* option — a HelixLLM-first chain with no serving
+	//     HelixLLM is a bluff.
+	// With no catalog wired nothing is confirmed: availability "unreported",
+	// dispatch withheld (§11.4.6 — the absence of a serving claim is not a
+	// serving claim). The ids stay listed so pre-validating CLI configs keep
+	// resolving them (CONST-032 / challenge guards) — what changes is only
+	// the honesty of the permission block.
+	var entries []catalog.Entry
+	catalogWired := h.catalogService != nil
+	if catalogWired {
+		entries = h.catalogService.Build()
+	}
+	serving := catalog.ServingModels(entries)
+
+	llmChainUsable := false
+	for _, e := range serving {
+		if e.Provider == catalog.NameHelixLLM {
+			llmChainUsable = true
+			break
+		}
+	}
+	debateUsable := len(serving) > 0
+
 	now := time.Now().Unix()
-	makeModel := func(id string) OpenAIModel {
+
+	// annotate builds one facade entry. The availability annotation is
+	// carried for the NON-usable states only — "unreported" (nothing
+	// reported) or "withheld" + reason — so the field never overstates; a
+	// usable entry states its usability through the permission block.
+	annotate := func(id string, usable bool, availability, withheldReason string) OpenAIModel {
 		return OpenAIModel{
 			ID:      id,
 			Object:  "model",
@@ -2315,41 +2358,77 @@ func (h *UnifiedHandler) Models(c *gin.Context) {
 				ID:                 id + "-permission",
 				Object:             "model_permission",
 				Created:            now,
-				AllowCreateEngine:  true,
-				AllowSampling:      true,
-				AllowLogprobs:      true,
+				AllowCreateEngine:  usable,
+				AllowSampling:      usable,
+				AllowLogprobs:      usable,
 				AllowSearchIndices: true,
 				AllowView:          true,
 				AllowFineTuning:    false,
 				Organization:       "helixagent",
 				IsBlocking:         false,
 			}},
-			Root:   id,
-			Parent: nil,
+			Availability:   availability,
+			WithheldReason: withheldReason,
+			Root:           id,
+			Parent:         nil,
 		}
 	}
 
-	response := OpenAIModelsResponse{
-		Object: "list",
-		Data: []OpenAIModel{
-			// Canonical names used in CLI configs and docs/api/API_REFERENCE.md.
-			makeModel("helixagent-debate"),
-			makeModel("helixagent-llm"),
-			// Semantic alias for the debate ensemble (user-visible
-			// "ensemble" terminology — same dispatch as helixagent-debate).
-			makeModel("helixagent-ensemble"),
-			// Legacy aliases retained so existing clients keep working.
-			makeModel("helix-debate"),
-			makeModel("helix-llm"),
-		},
+	const (
+		availabilityUnreported = "unreported"
+		availabilityWithheld   = "withheld"
+	)
+
+	// pseudo annotates one dispatch selector. Usable → no availability
+	// field (the permission block is the claim). Not usable → "unreported"
+	// when nothing is wired at all, "withheld"+reason when the catalog is
+	// wired but nothing is serving.
+	pseudo := func(id string, usable bool) OpenAIModel {
+		if usable {
+			return annotate(id, true, "", "")
+		}
+		if !catalogWired {
+			return annotate(id, false, availabilityUnreported, "")
+		}
+		return annotate(id, false, availabilityWithheld, "no_serving_backend")
 	}
 
-	c.JSON(http.StatusOK, response)
-}
+	data := []OpenAIModel{
+		// Canonical names used in CLI configs and docs/api/API_REFERENCE.md.
+		pseudo(ModelHelixAgentDebate, debateUsable),
+		pseudo(ModelHelixAgentLLM, llmChainUsable),
+		// Semantic alias for the debate ensemble (user-visible
+		// "ensemble" terminology — same dispatch as helixagent-debate).
+		pseudo(ModelHelixAgentEnsemble, debateUsable),
+		// Legacy aliases retained so existing clients keep resolving.
+		pseudo(ModelHelixDebate, debateUsable),
+		pseudo(ModelHelixLLM, llmChainUsable),
+	}
 
-// ModelsPublic is public version of models endpoint
-func (h *UnifiedHandler) ModelsPublic(c *gin.Context) {
-	h.Models(c) // Same implementation
+	// Append the serving layer's own helixllm options — serving, withheld
+	// and unreported, each annotated — so the wire-visible /v1/models
+	// listing matches what the serving layer is actually offering (FR-019).
+	// UNCONFIRMED: how a [:<variant>] suffix on ModelIdentity is handled
+	// downstream of this facade is not yet exercised; the wire id is the
+	// entry Name (helixllm/<id>).
+	for _, e := range catalog.HelixLLMOptions(entries) {
+		usable := e.Availability.Usable()
+		availability := availabilityUnreported
+		reason := ""
+		switch e.Availability {
+		case catalog.AvailabilityServing:
+			availability = "serving"
+		case catalog.AvailabilityWithheld:
+			availability = availabilityWithheld
+			reason = string(e.WithheldReason)
+		}
+		data = append(data, annotate(e.Name, usable, availability, reason))
+	}
+
+	c.JSON(http.StatusOK, OpenAIModelsResponse{
+		Object: "list",
+		Data:   data,
+	})
 }
 
 // Helper methods

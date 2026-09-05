@@ -49,8 +49,14 @@ func TestUnifiedHandler_Models(t *testing.T) {
 	assert.Contains(t, body, "helixagent-debate")
 }
 
-// TestUnifiedHandler_ModelsPublic tests public models endpoint
-func TestUnifiedHandler_ModelsPublic(t *testing.T) {
+// TestUnifiedHandler_Models_AvailabilityHonestWhenUnwired asserts the
+// HA-F2-001 contract on the public /v1/models surface: with no catalog
+// wired, pseudo-models stay listed (CLI configs keep resolving them) but
+// carry availability "unreported" and withhold dispatch permission — never
+// a usability claim on no evidence. (Reconciled per §11.4.120: the
+// ModelsPublic alias was removed — it had no route and one duplicate
+// implementation is the honest surface.)
+func TestUnifiedHandler_Models_AvailabilityHonestWhenUnwired(t *testing.T) {
 	t.Parallel()
 	handler := &UnifiedHandler{}
 
@@ -58,7 +64,7 @@ func TestUnifiedHandler_ModelsPublic(t *testing.T) {
 	c, _ := gin.CreateTestContext(w)
 	c.Request = httptest.NewRequest("GET", "/v1/models/public", nil)
 
-	handler.ModelsPublic(c)
+	handler.Models(c)
 
 	assert.Equal(t, http.StatusOK, w.Code)
 
@@ -66,6 +72,10 @@ func TestUnifiedHandler_ModelsPublic(t *testing.T) {
 	assert.Contains(t, body, "object")
 	assert.Contains(t, body, "data")
 	assert.Contains(t, body, "helixagent-debate")
+	assert.Contains(t, body, `"availability":"unreported"`,
+		"unwired catalog → every pseudo-model reports unreported, never a serving claim")
+	assert.Contains(t, body, `"allow_sampling":false`,
+		"unwired catalog → dispatch permission is withheld")
 }
 
 // TestUnifiedHandler_ChatCompletions_InvalidRequest tests invalid request
