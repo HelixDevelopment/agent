@@ -293,13 +293,33 @@ func (cbp *circuitBreakerProvider) CompleteStream(ctx context.Context, req *mode
 	return stream, err
 }
 
-// HealthCheck wraps the provider's HealthCheck method with circuit breaker protection
+// HealthCheck probes the underlying provider DIRECTLY, deliberately bypassing
+// the circuit breaker.
+//
+// HA-CB-001 root cause. This previously routed the probe through
+// cbp.circuitBreaker.Call, so a failing health probe was recorded as a provider
+// failure in the very same breaker that gates USER TRAFFIC. That is wrong in
+// both directions:
+//
+//   - A health probe is DIAGNOSTIC. It reports on the provider; it must not
+//     consume the breaker's failure budget, and it must not consume a half-open
+//     probe slot that belongs to real traffic.
+//   - A probe failing for a reason real traffic does not share — a wrong URL
+//     path, an auth scheme that applies only to the probe endpoint — would
+//     permanently lock out a backend that serves every real request perfectly.
+//
+// That second case is exactly what happened in production on 2026-09-07: the
+// helixllm provider probes /internal/health (a HelixLLM-gateway path) while
+// pointed at a plain OpenAI-compatible server, which 404s that path while
+// answering /v1/chat/completions correctly. The 30s health tick therefore fed a
+// permanent failure stream into the traffic breaker and, beating the 60s
+// recovery cooldown, starved recovery indefinitely.
+//
+// The breaker still protects real traffic: genuine consecutive failures on
+// Complete/CompleteStream open it exactly as before (see
+// TestHACB001_RealTrafficFailuresStillTripBreaker, the negative control that
+// keeps this change from silently disabling the breaker).
 func (cbp *circuitBreakerProvider) HealthCheck() error {
-	if cbp.circuitBreaker != nil {
-		return cbp.circuitBreaker.Call(func() error {
-			return cbp.provider.HealthCheck()
-		})
-	}
 	return cbp.provider.HealthCheck()
 }
 

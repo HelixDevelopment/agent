@@ -440,15 +440,44 @@ func (p *Provider) HealthCheck() error {
 		return err
 	}
 
-	endpoint := p.endpoint + healthEndpoint
-	resp, err := p.httpClient.Get(endpoint)
+	// Probe the HelixLLM gateway's own health path first.
+	resp, err := p.httpClient.Get(p.endpoint + healthEndpoint)
 	if err != nil {
 		return fmt.Errorf("health check failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode == http.StatusOK {
+		return nil
+	}
+
+	// HA-CB-001: healthEndpoint ("/internal/health") is a HelixLLM-GATEWAY
+	// path. This provider is also pointed at plain OpenAI-compatible servers
+	// via HELIX_LLM_LOCAL_OPENAI_ENDPOINT (e.g. a llama.cpp/vLLM-style server),
+	// which do not implement it and answer 404/405 while serving
+	// /v1/chat/completions perfectly. Reporting such a backend "unhealthy" is a
+	// false negative: it made the provider health monitor lie, and — before the
+	// paired fix in circuitBreakerProvider.HealthCheck — it permanently opened
+	// the traffic circuit breaker against a fully working backend.
+	//
+	// So when the gateway path is merely ABSENT, fall back to the
+	// OpenAI-compatible liveness surface this provider already relies on for
+	// GetModels. Any other status (5xx, 401, 429, ...) is a real health signal
+	// and is reported as-is — we do not fail open.
+	if resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusMethodNotAllowed {
 		return fmt.Errorf("health check returned status %d", resp.StatusCode)
+	}
+
+	modelsResp, modelsErr := p.httpClient.Get(p.endpoint + modelsEndpoint)
+	if modelsErr != nil {
+		return fmt.Errorf("health check failed: %s absent (status %d) and %s unreachable: %w",
+			healthEndpoint, resp.StatusCode, modelsEndpoint, modelsErr)
+	}
+	defer modelsResp.Body.Close()
+
+	if modelsResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("health check returned status %d (%s absent, status %d)",
+			modelsResp.StatusCode, healthEndpoint, resp.StatusCode)
 	}
 
 	return nil

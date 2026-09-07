@@ -799,7 +799,12 @@ func (cb *CircuitBreaker) Call(fn func() error) error {
 		if time.Since(cb.lastFailure) < cb.timeout {
 			return fmt.Errorf("circuit breaker is open")
 		}
+		// HA-CB-001: start the half-open probe window from a clean slate.
+		// Carrying a stale consecutiveSuccesses across the Open->HalfOpen
+		// transition could close the breaker on fewer than successThreshold
+		// probes actually observed in this window.
 		cb.state = StateHalfOpen
+		cb.consecutiveSuccesses = 0
 	}
 
 	err := fn()
@@ -851,9 +856,23 @@ func (cb *CircuitBreaker) onFailure() {
 func (cb *CircuitBreaker) onSuccess() {
 	cb.consecutiveSuccesses++
 
+	// HA-CB-001: a success MUST reset the consecutive-failure run.
+	//
+	// This reset was previously performed ONLY on the HalfOpen->Closed
+	// transition, which meant that while the breaker was CLOSED the field
+	// named "consecutiveFailures" was in fact a LIFETIME CUMULATIVE failure
+	// count that only ever grew. A provider that succeeded hundreds of times
+	// with a handful of scattered, unrelated failures in between would still
+	// trip, because those failures accumulated forever and never decayed.
+	//
+	// Observed in production 2026-09-07: helixllm served real completions
+	// successfully for ~90s and then tripped open with no burst of failures
+	// anywhere in the log. Matches internal/llm/circuit_breaker.go
+	// recordSuccess(), which has always reset this correctly.
+	cb.consecutiveFailures = 0
+
 	if cb.state == StateHalfOpen && cb.consecutiveSuccesses >= cb.successThreshold {
 		cb.state = StateClosed
-		cb.consecutiveFailures = 0
 		cb.consecutiveSuccesses = 0
 	}
 }
