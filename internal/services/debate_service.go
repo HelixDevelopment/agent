@@ -344,10 +344,28 @@ func NewDebateServiceWithDeps(
 		comprehensiveIntegration = nil
 	}
 
-	// Enable comprehensive system by default (can be disabled via env var)
-	useComprehensive := os.Getenv("HELIXAGENT_DISABLE_COMPREHENSIVE_DEBATE") != "true"
+	// The comprehensive system is OPT-IN, not the default.
+	//
+	// It was previously enabled by default, which made it the path every
+	// caller that did not set Metadata["source"] took. That path cannot
+	// answer a prompt: digital.vasic.debate/comprehensive builds its
+	// orchestrator with a nil ProviderInvoker and exposes no setter to
+	// supply one, so every agent's content comes from the upstream
+	// synthesiseContent() placeholder, and its DebateResponse has no
+	// final-answer field at all. Defaulting to it meant the advertised
+	// debate models returned a fixed status string for every prompt.
+	//
+	// Default OFF routes debates to conductRealDebate, which calls real
+	// providers. Operators exercising the comprehensive orchestrator can
+	// still opt in explicitly; it then surfaces real agent content or
+	// fails honestly (see conductComprehensiveDebate).
+	useComprehensive := strings.EqualFold(os.Getenv(envEnableComprehensiveDebate), "true")
 	if comprehensiveIntegration != nil && useComprehensive {
-		logger.Info("[Debate Service] Comprehensive Multi-Agent Debate System enabled (set HELIXAGENT_DISABLE_COMPREHENSIVE_DEBATE=true to disable)")
+		logger.Warn("[Debate Service] Comprehensive Multi-Agent Debate System explicitly enabled via " +
+			envEnableComprehensiveDebate + " — it has no LLM provider wired upstream and cannot answer prompts")
+	} else {
+		logger.Info("[Debate Service] Using provider-backed debate path (comprehensive system off by default; set " +
+			envEnableComprehensiveDebate + "=true to opt in)")
 	}
 
 	logger.Info("[Debate Service] Initialized with integrated features: Test-Driven, 4-Pass Validation, Tool Integration, Enhanced Intent, HelixSpecifier, SpecKit, Reflexion, Adversarial, Approval Gates, Provenance, Performance Optimizer, Comprehensive Multi-Agent Debate")

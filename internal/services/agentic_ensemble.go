@@ -176,12 +176,28 @@ func (e *AgenticEnsemble) toolAugmentedDebate(
 
 	debateID := fmt.Sprintf("ae-%s", uuid.New().String()[:8])
 
+	// A debate without a participant roster produces nothing, and a debate
+	// without Metadata["source"] is routed by ConductDebate into the
+	// comprehensive system — which cannot produce model-generated text at all
+	// (see agentic_debate_participants.go). Both must be supplied together.
+	participants := e.buildDebateParticipants(topic)
+	if len(participants) == 0 {
+		return nil, fmt.Errorf(
+			"debate unavailable: no LLM provider could be resolved for the ensemble " +
+				"debate roster; configure a provider (or set " + envDebateProvider +
+				") — refusing to return a synthesised answer")
+	}
+
 	config := &DebateConfig{
-		DebateID:  debateID,
-		Topic:     topic,
-		MaxRounds: 3,
-		Timeout:   e.config.AgentTimeout,
-		Strategy:  "confidence_weighted",
+		DebateID:     debateID,
+		Topic:        topic,
+		Participants: participants,
+		MaxRounds:    3,
+		Timeout:      e.config.AgentTimeout,
+		Strategy:     "confidence_weighted",
+		// "source" routes ConductDebate to the real, provider-backed debate
+		// (conductRealDebate) instead of the comprehensive stub path.
+		Metadata: map[string]any{"source": "agentic_ensemble"},
 	}
 
 	debateResult, err := e.debateService.ConductDebate(ctx, config)
@@ -563,6 +579,12 @@ func (e *AgenticEnsemble) debateResultToEnsemble(
 		}
 	}
 
+	// Tokens really consumed across every participant call in every round.
+	// Without this the OpenAI-compatible envelope reported usage {0,0,0}
+	// alongside a 200, which is itself a tell that no model ran
+	// (convertToOpenAIChatResponse derives usage from Selected.TokenSplit()).
+	debateTokens := totalDebateTokens(dr)
+
 	var selectedResp *models.LLMResponse
 	if dr.BestResponse != nil {
 		selectedResp = &models.LLMResponse{
@@ -571,6 +593,7 @@ func (e *AgenticEnsemble) debateResultToEnsemble(
 			ProviderName: dr.BestResponse.LLMProvider,
 			Confidence:   dr.BestResponse.QualityScore,
 			ResponseTime: dr.Duration.Milliseconds(),
+			TokensUsed:   debateTokens,
 		}
 	} else if dr.Consensus != nil && dr.Consensus.FinalPosition != "" {
 		selectedResp = &models.LLMResponse{
@@ -579,6 +602,7 @@ func (e *AgenticEnsemble) debateResultToEnsemble(
 			ProviderName: "consensus",
 			Confidence:   dr.Consensus.Confidence,
 			ResponseTime: dr.Duration.Milliseconds(),
+			TokensUsed:   debateTokens,
 		}
 	}
 
