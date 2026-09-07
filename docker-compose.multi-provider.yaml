@@ -59,6 +59,15 @@ services:
     ports:
       - "8080:8080"
     environment:
+      # Local-first serving switches (spec 002 / HA-F2-002) — see
+      # docker-compose.yml for the rationale: the gate reads the PROCESS
+      # environment, so a switch not named here cannot reach the server.
+      HELIX_CLOUD_PROVIDERS: ${HELIX_CLOUD_PROVIDERS:-}
+      USE_HELIX_LLM: ${USE_HELIX_LLM:-}
+      HELIX_LLM_ENDPOINT: ${HELIX_LLM_ENDPOINT:-}
+      HELIX_LLM_API_KEY: ${HELIX_LLM_API_KEY:-}
+      HELIX_LLM_TLS_SKIP_VERIFY: ${HELIX_LLM_TLS_SKIP_VERIFY:-}
+
       # Database Configuration
       DB_HOST: postgres
       DB_PORT: 5432

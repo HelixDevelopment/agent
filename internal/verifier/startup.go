@@ -22,6 +22,7 @@ import (
 	"dev.helix.agent/internal/llm/providers/junie"
 	"dev.helix.agent/internal/llm/providers/qwen"
 	"dev.helix.agent/internal/llm/providers/zen"
+	"dev.helix.agent/internal/localfirst"
 	"digital.vasic.concurrency/pkg/safe"
 	"digital.vasic.llmsverifier/api_keys"
 	"github.com/HelixDevelopment/helix_agent/Toolkit/Providers/Chutes"
@@ -386,12 +387,38 @@ func (sv *StartupVerifier) discoverProviders(ctx context.Context) ([]*ProviderDi
 
 	sv.log.WithField("total", len(providerTypes)).Info("Provider discovery order determined (faulty keys will be checked last)")
 
+	// Local-first default (spec 002, HA-F2-002): boot-time discovery of CLOUD
+	// providers requires an explicit operator opt-in. Without this gate a key
+	// sitting in the operator's environment was enough for the verifier to call
+	// DiscoverModels() — a REAL outbound request to a third-party endpoint —
+	// and then to send real verification prompts through
+	// createProviderForVerification, at boot, while every configuration switch
+	// reported "cloud disabled". Same predicate as the registry's two gates
+	// (internal/localfirst).
+	//
+	// The gate is provider-CLASS aware, not a blunt kill switch: LOCAL
+	// (self-hosted) providers stay discoverable, which is the point of
+	// local-first. Local entries carry env vars too (OLLAMA_BASE_URL,
+	// HELIX_LLM_ENDPOINT), so gating the whole loop would have disabled local
+	// discovery along with the cloud.
+	cloudOptIn := localfirst.CloudProvidersOptedIn()
+	skippedCloud := 0
+
 	for _, providerType := range providerTypes {
 		if seen[providerType] {
-			continue // Already discovered via OAuth
+			// NOTE: nothing pre-populates `seen` any more — the OAuth pass that
+			// used to fill it was dropped in d4fdea02 (see discoverOAuthProviders
+			// below). The check is kept because `seen` is still written further
+			// down this function, and because it is the seam a re-wired OAuth
+			// pass would use again.
+			continue
 		}
 
 		info := SupportedProviders[providerType]
+		if !cloudOptIn && info.AuthType != AuthTypeLocal {
+			skippedCloud++
+			continue
+		}
 		for _, envVar := range info.EnvVars {
 			apiKey := os.Getenv(envVar)
 			if apiKey != "" && !isPlaceholder(apiKey) {
@@ -429,6 +456,13 @@ func (sv *StartupVerifier) discoverProviders(ctx context.Context) ([]*ProviderDi
 				break
 			}
 		}
+	}
+
+	if skippedCloud > 0 {
+		sv.log.WithFields(logrus.Fields{
+			"skipped": skippedCloud,
+			"opt_in":  localfirst.EnvCloudProviders + "=true",
+		}).Info("Cloud provider discovery skipped: local-first default, operator has not opted in")
 	}
 
 	// 3. Discover free providers (always available)
@@ -565,7 +599,35 @@ func (sv *StartupVerifier) discoverModelsGeneric(ctx context.Context, providerTy
 	return models, nil
 }
 
-// discoverOAuthProviders discovers OAuth-based providers
+// discoverOAuthProviders discovers OAuth-based providers.
+//
+// CURRENTLY UNREACHABLE — retained deliberately (§11.4.124: no removal of
+// seemingly-dead code without captured proof it is genuinely no longer needed).
+//
+// What the git history shows (verified by pickaxe, 2026-09-06):
+//   - 8d2d393c introduced this function TOGETHER WITH its call site at the head
+//     of discoverProviders ("1. Discover OAuth providers first (highest
+//     priority)"), which also pre-populated the `seen` map from the results.
+//   - d4fdea02 ("feat(verifier): integrate API key tracking into
+//     StartupVerifier") rewrote that head to add faulty/unsupported-key
+//     tracking and priority ordering, and in doing so DELETED the call and the
+//     `seen` pre-population — while leaving this function defined. Nothing
+//     OAuth-equivalent replaced it, and the commit message does not mention
+//     removing OAuth discovery.
+//
+// So this reads as collateral loss during an unrelated rewrite, not a
+// deliberate deprecation. Two visible consequences:
+//   - The `// Already discovered via OAuth` comment on the `seen` check in
+//     discoverProviders is stale: nothing pre-populates that map any more.
+//   - The HelixLLM block below (and its localfirst.HelixLLMEnabled() predicate)
+//     is a stranded LOCAL discovery path that never runs, so a reachable
+//     HelixLLM instance is not surfaced by boot-time discovery through here.
+//
+// Deleting it would silently drop that stranded HelixLLM block; re-wiring it is
+// a behaviour change (it would restore boot-time OAuth-credentialed cloud
+// discovery, which must then sit behind localfirst.CloudProvidersOptedIn() like
+// every other implicit acquisition). Both are decisions for a separate,
+// deliberate change — neither is taken here.
 func (sv *StartupVerifier) discoverOAuthProviders(ctx context.Context) []*ProviderDiscoveryResult {
 	var providers []*ProviderDiscoveryResult
 
@@ -605,9 +667,10 @@ func (sv *StartupVerifier) discoverOAuthProviders(ctx context.Context) []*Provid
 
 	// HelixLLM discovery (self-hosted via llama.cpp) — in main discoverProviders.
 	// Local-first default (HA-F2-002): ON unless USE_HELIX_LLM is an explicit
-	// false. Mirrors services.HelixLLMEnabledDefault(); the local helper is
-	// used here because services imports verifier (import cycle).
-	if getEnvBoolVerifier("USE_HELIX_LLM", true) {
+	// false. The predicate lives in the leaf package internal/localfirst so this
+	// file and internal/services share ONE implementation (services imports
+	// verifier, so the predicate cannot live in services).
+	if localfirst.HelixLLMEnabled() {
 		helixLLMURL := os.Getenv("HELIX_LLM_ENDPOINT")
 		if helixLLMURL == "" {
 			helixLLMURL = "https://localhost:8443"
@@ -645,24 +708,34 @@ func (sv *StartupVerifier) discoverFreeProviders(ctx context.Context) []*Provide
 		return providers
 	}
 
-	// Zen is always available (anonymous mode)
-	// Updated 2026-01-29: Using dynamic model discovery from Zen API/CLI
-	zenModels := zen.DiscoverFreeModels()
-	sv.log.WithFields(logrus.Fields{
-		"count":  len(zenModels),
-		"models": zenModels,
-	}).Info("Dynamically discovered Zen models")
+	// Zen needs NO credential, but it still talks to a public third-party
+	// endpoint, so it is a cloud acquisition and obeys the same opt-in as every
+	// other one (HA-F2-002). This mirrors the registry, where the synthesized
+	// zen default config is gated on r.autoDiscovery. Only the Zen block is
+	// gated — the local Ollama block below must keep running.
+	if localfirst.CloudProvidersOptedIn() {
+		// Zen is always available (anonymous mode)
+		// Updated 2026-01-29: Using dynamic model discovery from Zen API/CLI
+		zenModels := zen.DiscoverFreeModels()
+		sv.log.WithFields(logrus.Fields{
+			"count":  len(zenModels),
+			"models": zenModels,
+		}).Info("Dynamically discovered Zen models")
 
-	providers = append(providers, &ProviderDiscoveryResult{
-		ID:          "zen",
-		Type:        "zen",
-		AuthType:    AuthTypeFree,
-		Discovered:  true,
-		Source:      "dynamic_discovery",
-		Credentials: "Anonymous",
-		BaseURL:     "https://opencode.ai/zen/v1/chat/completions",
-		Models:      zenModels,
-	})
+		providers = append(providers, &ProviderDiscoveryResult{
+			ID:          "zen",
+			Type:        "zen",
+			AuthType:    AuthTypeFree,
+			Discovered:  true,
+			Source:      "dynamic_discovery",
+			Credentials: "Anonymous",
+			BaseURL:     "https://opencode.ai/zen/v1/chat/completions",
+			Models:      zenModels,
+		})
+	} else {
+		sv.log.WithField("opt_in", localfirst.EnvCloudProviders+"=true").
+			Info("Anonymous Zen discovery skipped: local-first default, operator has not opted in")
+	}
 
 	// Check if Ollama is explicitly enabled
 	ollamaEnabled := os.Getenv("OLLAMA_ENABLED")

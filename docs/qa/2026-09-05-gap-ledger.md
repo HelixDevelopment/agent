@@ -110,3 +110,180 @@ Conclusion: **cloud paths ARE reachable by default** (env-credentialed providers
   }
 ]
 ```
+
+
+---
+
+## Remediation record — HA-F2-002 (added 2026-09-06)
+
+Everything above this line is the 2026-09-05 read-only snapshot of the PRE-fix
+state and is left unedited. This section records what actually landed.
+
+### Correction to commit `7ad2b508`
+
+`7ad2b508` ("local-first serving defaults — local chain ON, cloud opt-in")
+delivered the `USE_HELIX_LLM` flip correctly, but its message and the docs it
+shipped claimed `HELIX_CLOUD_PROVIDERS` covered "every env-credentialed cloud
+provider". **That claim was false**, and is recorded here rather than quietly
+dropped (§11.4 — an overstated closure is a PASS-bluff at the documentation
+layer on top of the functional gap).
+
+What `7ad2b508` actually gated: **one** site —
+`NewProviderRegistry`'s `enableAutoDiscovery := CloudProvidersOptedIn()`
+(`internal/services/provider_registry.go:331`), which transitively covered
+`initAutoDiscovery` and the synthesized anonymous-`zen` default.
+
+What it did NOT gate, both live in the standard deployment:
+
+1. `LoadRegistryConfigFromAppConfig` (`provider_registry.go`, called from
+   `router.go:263`) set `Enabled: <KEY> != ""` for
+   deepseek/claude/gemini/qwen/openrouter, so `createProviderFromConfig`'s
+   `cfg.Enabled && cfg.APIKey != ""` branch built a live cloud client from an
+   ambient key. The chat handler's `ListProvidersOrderedByScore` fallback and
+   `debate_service`'s `GetProvider(...)` calls could then route to it.
+2. `verifier.discoverProviders` (`internal/verifier/startup.go`), reached at
+   every boot from `cmd/helixagent/main.go` `runStartupVerification`, called
+   `DiscoverModels(...)` per env-credentialed provider and then sent real
+   verification prompts via `createProviderForVerification`.
+   `grep HELIX_CLOUD_PROVIDERS internal/verifier/` returned zero hits.
+
+The shipped `docker-compose.yml:159-169` forwards `CLAUDE_API_KEY`,
+`DEEPSEEK_API_KEY`, `GEMINI_API_KEY` and `QWEN_API_KEY` from the operator's
+`.env` into the container, so this was the normal path, not an edge case.
+
+Why the existing RED test did not catch it: `TestProviderRegistry_LocalFirstDefaults`
+calls `clearProviderEnvVarsForTest(t)` first, so it never observed a SET key
+still enabling a provider, and it asserted internal flags rather than the
+absence of a cloud route.
+
+### What landed (2026-09-06)
+
+- One shared predicate in the leaf package `internal/localfirst`
+  (`CloudProvidersOptedIn`, `HelixLLMEnabled`). `internal/services` delegates to
+  it; `internal/verifier` imports it directly, retiring the duplicated
+  `getEnvBoolVerifier("USE_HELIX_LLM", true)` mirror that existed because
+  services imports verifier.
+- Four gate sites, all the same predicate:
+  1. `NewProviderRegistry` — auto-discovery + anonymous zen (unchanged, from `7ad2b508`).
+  2. `LoadRegistryConfigFromAppConfig` — env-credentialed provider `Enabled`.
+  3. `verifier.discoverProviders` + `discoverFreeProviders` — boot-time cloud
+     discovery/verification and the anonymous zen probe. Provider-CLASS aware:
+     `AuthTypeLocal` entries (`helixllm`, `ollama`) stay discoverable.
+  4. `NewEmbeddingManager` — the ambient `OPENAI_API_KEY` embedding path behind
+     the wired `POST /v1/protocols/execute` (`protocol_type: embedding`), which
+     the original review did not name. Degrades to the existing local embedding
+     fallback rather than failing.
+- Deliberately NOT gated (each is already an explicit operator decision):
+  a provider named by hand in the registry config; `SEARCH_EMBEDDER_TYPE=openai`;
+  the separate `cmd/sanity-check` operator tool; OAuth session refresh for
+  credentials the operator established with `claude login` / `qwen login`.
+- Guards (§11.4.115 polarity switch, §11.4.135 standing regression guards):
+  `internal/services/cloud_optin_route_red_test.go`,
+  `internal/services/cloud_optin_embedding_red_test.go`,
+  `internal/verifier/cloud_optin_discovery_red_test.go`.
+  These observe the ROUTE — a constructed client, or a counted outbound request
+  through a swapped transport / httptest endpoint — not a configuration flag.
+  Both polarities are covered: cloud must be refused when unset AND allowed when
+  the operator opts in.
+
+### Honest boundary (§11.4.6)
+
+Gating boot-time verification means an operator who wants their cloud keys
+verified at startup must set `HELIX_CLOUD_PROVIDERS=true`. This is coherent
+rather than a loss: with cloud not opted in, nothing can route to those
+providers, so verifying them buys nothing and costs an outbound request plus a
+billed prompt per provider. The opt-in restores the old behaviour exactly, and
+`TestCloudGate_VerifierDiscoversCloudWithOptIn` proves it.
+
+Not claimed: that no cloud path remains anywhere in the tree. The enumeration
+covered `internal/` and `cmd/` non-test sources; `cmd/sanity-check` and
+`SEARCH_EMBEDDER_TYPE=openai` are known, deliberately-ungated, separately-opted-in
+paths, and `internal/embeddings/models/registry.go` carries an ungated OpenAI
+default that is currently unreachable (the RAG pipeline it belongs to is wired
+with `Pipeline: nil` at `router.go:1235`) — it will need this same gate if that
+wiring is ever completed.
+
+---
+
+## Round-8 review remediation — HA-F2-002 (added 2026-09-06)
+
+Append-only, like the section above: nothing earlier in this file is edited.
+The two items below SUPERSEDE the corresponding statements in the previous
+section, which are left in place as the record of what was believed then.
+
+### The fifth gate site: OAuth session refresh (was "deliberately NOT gated")
+
+The previous section listed, under "Deliberately NOT gated", *"OAuth session
+refresh for credentials the operator established with `claude login` /
+`qwen login`."* That classification was too generous and is now **withdrawn**;
+the path is gated.
+
+What was actually there (`internal/router/router.go:428-441`, pre-fix):
+`authadapter.GetOAuthCredentialPaths()`
+(`internal/adapters/auth/integration.go:383-399`) `os.Stat`s
+`~/.claude/.credentials.json` and `~/.qwen/oauth_creds.json`. **File presence
+alone** — no env var, no config, no operator statement of intent — was enough
+to construct an `OAuthCredentialManager` and `Start()` a 5-minute ticker whose
+`RefreshAll` POSTs `grant_type=refresh_token` to
+`https://api.anthropic.com/oauth/token` and
+`https://dashscope.aliyuncs.com/api/token`. The only guard was
+`!standaloneMode`, i.e. it ran in exactly the production configuration.
+
+Why the earlier reasoning fails: the `claude login` that wrote that file
+authorised **Claude Code**, not HelixAgent. An ambient credential file on disk
+is not the operator asking *this* service to reach a third party — and that is
+precisely the distinction the other four sites are gated on. Being latent
+today (the generic reader unmarshals a flat
+`{access_token, refresh_token, expires_at}` while the real Claude file nests
+under `claudeAiOauth` and the Qwen file uses a millisecond `expiry_date`, so
+`NeedsRefresh` never fires against the real files) is a schema accident, not a
+guarantee; it arms itself the day either upstream schema changes.
+
+Landed:
+
+- `internal/router/oauth_credentials.go` — `newOAuthCredentialManager`, gated
+  on the same `localfirst.CloudProvidersOptedIn()` predicate as the other four.
+  `SetupRouterWithContext` now calls it instead of inlining the block.
+- `internal/adapters/auth/integration.go:408` — the identical ungated block in
+  `InitializeAuthIntegration` is gated too. That function has **no production
+  caller** today (only `auth_middleware_test.go:514`), so this closes the shape
+  rather than a live route; left in place per §11.4.124 rather than deleted.
+- Guard: `internal/router/cloud_optin_oauth_red_test.go`, matching the sibling
+  guards' shape — it counts outbound requests through a swapped
+  `http.DefaultTransport` (the refresher's client has a nil `Transport`), with
+  the seeded credential files carrying the FLAT schema and a past expiry so the
+  refresh genuinely fires. Both polarities plus the standalone-mode boundary.
+
+Honest boundary (§11.4.6): the operator loses nothing. With cloud not opted in
+there is no route a refreshed token could serve, and `HELIX_CLOUD_PROVIDERS=true`
+restores the refresh loop unchanged — `TestCloudGate_OAuthRefreshStartsWithOptIn`
+proves it.
+
+### Correction: why the `embeddings/models/registry.go` landmine is unreachable
+
+The previous section justified the ungated `OPENAI_API_KEY` read at
+`internal/embeddings/models/registry.go:159` as unreachable because
+"the RAG pipeline it belongs to is wired with `Pipeline: nil` at
+`router.go:1235`". That is true but **not load-bearing** — it argues from one
+consumer's configuration rather than from reachability, and would stop holding
+the moment anyone constructed a pipeline anywhere.
+
+The firmer reason, both halves verified in this session:
+
+1. `NewEmbeddingModelRegistry` (`internal/embeddings/models/registry.go:116`)
+   is the **sole caller** of the `loadDefaultConfigs()` that performs the
+   ungated read (`registry.go:132` → `:157-190`), and it has **zero non-test
+   callers module-wide**. Every call site is a `_test.go` file
+   (`internal/handlers/rag_handler_test.go:72`,
+   `internal/rag/pipeline_test.go:53`,
+   `internal/rag/pipeline_extended_test.go:376`,
+   `internal/embeddings/models/registry{,_extended}_test.go`,
+   `tests/unit/rag/pipeline_test.go:73,236,244,259,283`).
+2. `RAGHandlerConfig.EmbeddingRegistry` (`internal/handlers/rag_handler.go:23`)
+   is likewise never set outside tests — the router call site
+   (`router.go:1237-1240`) passes only `Pipeline` and `Logger`.
+
+So no production code path constructs the registry at all; the `Pipeline: nil`
+wiring is a second, weaker line of defence behind that. The gate is still owed
+if the registry is ever constructed from production code — which is what makes
+fact 1 the one worth stating, since it is the fact that would change.

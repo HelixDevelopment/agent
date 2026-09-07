@@ -119,7 +119,7 @@ providers:
 | `ZEN_API_KEY`     | API key for paid Zen models          | For paid models   |
 | `ZEN_BASE_URL`    | Base URL for Zen HTTP API            | No (has default)  |
 | `USE_HELIX_LLM`        | Local HelixLLM/llama.cpp chain. **Default ON** — set to an explicit `false`/`0`/`no`/`off` to opt OUT | No |
-| `HELIX_CLOUD_PROVIDERS` | Cloud provider auto-discovery (every env-credentialed cloud provider + anonymous zen). **Default OFF** — set to `true`/`1`/`yes`/`on` to opt IN | No |
+| `HELIX_CLOUD_PROVIDERS` | Every *implicit* cloud acquisition: registry auto-discovery, providers enabled from an env API key, the anonymous zen endpoint, boot-time verifier discovery/verification, OpenAI embeddings, and OAuth session refresh for ambient `~/.claude` / `~/.qwen` credential files. **Default OFF** — set to `true`/`1`/`yes`/`on` to opt IN. A provider you configure explicitly by hand is not gated. See `docs/HELIXLLM_USER_MANUAL.md` → "Cloud opt-in: exactly what the switch covers" | No |
 
 ## Generic Provider (OpenAI-Compatible)
 

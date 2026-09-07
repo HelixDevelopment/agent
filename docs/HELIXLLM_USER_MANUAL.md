@@ -96,8 +96,11 @@ Add these settings:
 # this line is only needed to make the opt-in explicit or to document intent.
 USE_HELIX_LLM=true
 
-# Cloud provider auto-discovery is OFF by default — opt in only if you
-# want env-credentialed cloud providers and the anonymous zen endpoint:
+# Cloud is OFF by default. One switch covers every path by which a cloud
+# provider becomes reachable WITHOUT you naming it: registry auto-discovery,
+# providers enabled from an API key in your environment, the credential-less
+# anonymous zen endpoint, boot-time verifier discovery/verification, and
+# OpenAI embeddings on /v1/protocols/execute. Opt in only if you want them:
 # HELIX_CLOUD_PROVIDERS=true
 
 # HelixLLM Configuration
@@ -123,13 +126,54 @@ HELIX_LLM_USE_HELIXAGENT_MEMORY=true
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `USE_HELIX_LLM` | `true` (local-first default, HA-F2-002) | Local HelixLLM/llama.cpp chain. Default ON; set to an explicit `false`/`0`/`no`/`off` to opt OUT |
-| `HELIX_CLOUD_PROVIDERS` | `false` | Cloud provider auto-discovery (env-credentialed cloud providers + anonymous zen). Default OFF; set to `true`/`1`/`yes`/`on` to opt IN |
+| `HELIX_CLOUD_PROVIDERS` | `false` | Every *implicit* cloud acquisition — see [Cloud opt-in: exactly what the switch covers](#cloud-opt-in-exactly-what-the-switch-covers). Default OFF; set to `true`/`1`/`yes`/`on` to opt IN |
 | `HELIX_LLM_ENDPOINT` | `https://localhost:8443` | HelixLLM API endpoint |
 | `HELIX_LLM_API_KEY` | - | API key (if required) |
 | `HELIX_LLM_TLS_SKIP_VERIFY` | `false` | Skip TLS verification (secure-by-default; set `true` only for local dev against self-signed certs) |
 | `HELIX_LLM_MODE` | `full` | Deployment mode |
 | `HELIX_LLM_DB_HOST` | `helixllm-postgres` | PostgreSQL host |
 | `HELIX_LLM_REDIS_HOST` | `helixllm-redis` | Redis host |
+
+### Cloud opt-in: exactly what the switch covers
+
+`HELIX_CLOUD_PROVIDERS` gates every **implicit** cloud acquisition — every path
+where the process decides on its own, from a credential sitting in the
+environment (or from no credential at all), to build a cloud client or send a
+cloud request. With the switch unset or false, all of the following are off:
+
+| Path | Where | What it does when opted in |
+|------|-------|----------------------------|
+| Registry auto-discovery | `NewProviderRegistry` | sweeps the environment and registers every credentialed provider |
+| Anonymous zen default | `NewProviderRegistry` (synthesized `zen` config) | enables a credential-less provider that talks to a public endpoint |
+| Env-credentialed providers | `LoadRegistryConfigFromAppConfig` | enables `deepseek`/`claude`/`gemini`/`qwen`/`openrouter` from `DEEPSEEK_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `QWEN_API_KEY`, `OPENROUTER_API_KEY` |
+| Boot-time verifier | `verifier.discoverProviders` | discovers + model-lists + sends real verification prompts to every credentialed cloud provider at startup |
+| Cloud embeddings | `NewEmbeddingManager` (`POST /v1/protocols/execute`, `protocol_type: embedding`) | sends text to `api.openai.com` using `OPENAI_API_KEY`; without the opt-in the local embedding fallback is used instead |
+| OAuth session refresh | `newOAuthCredentialManager` (`internal/router/oauth_credentials.go`) | starts a 5-minute ticker that POSTs `grant_type=refresh_token` to `api.anthropic.com` / `dashscope.aliyuncs.com` for whatever `~/.claude/.credentials.json` / `~/.qwen/oauth_creds.json` happen to exist |
+
+**What the switch deliberately does NOT gate** (each is already an explicit
+operator decision, so the switch has nothing to ask):
+
+- A provider you write into the registry configuration by hand (`Enabled: true`
+  plus an `APIKey`). You named it; it is used.
+- `SEARCH_EMBEDDER_TYPE=openai`, which is its own explicit opt-in for the search
+  service's embedder.
+- The separate `cmd/sanity-check` operator tool, which probes configured
+  provider endpoints on demand. It is never invoked by the server.
+
+> **Why OAuth session refresh IS gated** (it was excluded in an earlier
+> revision, on the reasoning that `claude login` is already an operator
+> decision). The discovery is by `os.Stat` alone: file presence, nothing more.
+> The login that wrote that file authorised **Claude Code**, not HelixAgent,
+> and an ambient file on disk is not you asking *this* service to reach a
+> third-party endpoint — which is exactly the distinction every other row above
+> is gated on. Nothing is lost by gating it: with cloud switched off there is
+> no route for a refreshed token to serve, and `HELIX_CLOUD_PROVIDERS=true`
+> restores the refresh loop unchanged.
+
+**Local providers are never gated.** `helixllm` and `ollama` stay discoverable
+and routable with cloud switched off — that is the point of local-first.
+
+---
 
 ### Deployment Modes
 

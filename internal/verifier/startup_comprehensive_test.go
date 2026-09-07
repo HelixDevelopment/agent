@@ -242,7 +242,14 @@ func TestStartupVerifier_discoverFreeProviders(t *testing.T) {
 		assert.Empty(t, providers)
 	})
 
-	t.Run("enabled free providers", func(t *testing.T) {
+	// Reconciled for the local-first cloud gate (HA-F2-002, §11.4.120).
+	// Zen needs no credential but talks to a public third-party endpoint, so it
+	// is a cloud acquisition and now obeys HELIX_CLOUD_PROVIDERS — matching the
+	// provider registry, where the synthesized zen config has always been gated
+	// on r.autoDiscovery. Every original assertion is preserved under the
+	// opt-in; the opted-out invariant is added rather than substituted.
+	t.Run("enabled free providers, cloud opted in", func(t *testing.T) {
+		t.Setenv("HELIX_CLOUD_PROVIDERS", "true")
 		cfg := DefaultStartupConfig()
 		cfg.EnableFreeProviders = true
 		logger := logrus.New()
@@ -262,6 +269,21 @@ func TestStartupVerifier_discoverFreeProviders(t *testing.T) {
 			}
 		}
 		assert.True(t, zenFound, "Zen provider should be discovered")
+	})
+
+	t.Run("enabled free providers, cloud NOT opted in", func(t *testing.T) {
+		t.Setenv("HELIX_CLOUD_PROVIDERS", "")
+		cfg := DefaultStartupConfig()
+		cfg.EnableFreeProviders = true
+		logger := logrus.New()
+		logger.SetLevel(logrus.WarnLevel)
+		sv := NewStartupVerifier(cfg, logger)
+
+		providers := sv.discoverFreeProviders(context.Background())
+		for _, p := range providers {
+			assert.NotEqual(t, "zen", p.Type,
+				"the anonymous zen endpoint is a cloud acquisition: it must not be discovered without an explicit opt-in")
+		}
 	})
 }
 
@@ -551,6 +573,14 @@ func TestStartupVerifier_OAuthEnabled(t *testing.T) {
 }
 
 func TestStartupVerifier_DiscoverProviders(t *testing.T) {
+	// Reconciled for the local-first cloud gate (HA-F2-002, §11.4.120): the
+	// "at minimum, free providers are discovered" property only holds once the
+	// operator has opted in to cloud, because the free provider in question
+	// (zen) is a public third-party endpoint. The opted-OUT property — nothing
+	// cloud discovered, zero outbound requests — is asserted by
+	// TestCloudGate_VerifierDoesNotDiscoverCloudWithoutOptIn.
+	t.Setenv("HELIX_CLOUD_PROVIDERS", "true")
+
 	cfg := DefaultStartupConfig()
 	cfg.EnableFreeProviders = true
 	logger := logrus.New()

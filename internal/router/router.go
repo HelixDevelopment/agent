@@ -425,20 +425,10 @@ func SetupRouterWithContext(cfg *config.Config) *RouterContext {
 		}
 	}
 
-	// Initialize OAuth credential manager for providers using OAuth (Claude, Qwen)
-	var oauthManager *authadapter.OAuthCredentialManager
-	if !standaloneMode {
-		oauthPaths := authadapter.GetOAuthCredentialPaths()
-		if len(oauthPaths) > 0 {
-			oauthManager, err = authadapter.NewOAuthCredentialManager(oauthPaths, "helixagent", logger)
-			if err != nil {
-				logger.WithError(err).Warn("Failed to initialize OAuth credential manager")
-			} else {
-				oauthManager.Start(context.Background())
-				logger.WithField("providers", len(oauthPaths)).Info("OAuth credential manager initialized")
-			}
-		}
-	}
+	// Initialize OAuth credential manager for providers using OAuth (Claude, Qwen).
+	// Gated on the cloud opt-in — see newOAuthCredentialManager in
+	// oauth_credentials.go for why file presence alone is not operator intent.
+	oauthManager := newOAuthCredentialManager(context.Background(), standaloneMode, logger)
 
 	// Initialize container adapter for container orchestration
 	var containerAdapt *containeradapter.Adapter

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"dev.helix.agent/internal/localfirst"
 	genericoauth "digital.vasic.auth/pkg/oauth"
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -405,8 +406,14 @@ func InitializeAuthIntegration(router *gin.Engine, userService UserService, jwtS
 	router.Use(APIKeyAuthMiddleware(apiKeyValidator, "X-API-Key"))
 	router.Use(BearerTokenAuthMiddleware(bearerValidator))
 
+	// Local-first default (spec 002, HA-F2-002): starting the refresh loop from
+	// the mere PRESENCE of ~/.claude/.credentials.json or ~/.qwen/oauth_creds.json
+	// is an implicit cloud acquisition and obeys the same opt-in as every other
+	// one. Mirrors the gate in internal/router/oauth_credentials.go; this copy
+	// has no production caller today, so gating it closes the shape rather than a
+	// live route.
 	oauthPaths := GetOAuthCredentialPaths()
-	if len(oauthPaths) > 0 {
+	if localfirst.CloudProvidersOptedIn() && len(oauthPaths) > 0 {
 		oauthManager, err := NewOAuthCredentialManager(oauthPaths, "helixagent", logger)
 		if err != nil {
 			logger.WithError(err).Warn("Failed to initialize OAuth credential manager")

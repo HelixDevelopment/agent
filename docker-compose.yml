@@ -155,6 +155,19 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-helixagent123}
       REDIS_DB: ${REDIS_DB:-0}
 
+      # Local-first serving switches (spec 002 / HA-F2-002).
+      # These MUST be forwarded: they are the documented operator controls in
+      # .env.example, and without them an operator who sets HELIX_CLOUD_PROVIDERS
+      # in their .env finds the switch has no effect inside the container — the
+      # gate reads the *process* environment, and compose only forwards what is
+      # named here. Both are empty-by-default, which is the local-first posture:
+      # local chain ON, cloud OFF.
+      HELIX_CLOUD_PROVIDERS: ${HELIX_CLOUD_PROVIDERS:-}
+      USE_HELIX_LLM: ${USE_HELIX_LLM:-}
+      HELIX_LLM_ENDPOINT: ${HELIX_LLM_ENDPOINT:-}
+      HELIX_LLM_API_KEY: ${HELIX_LLM_API_KEY:-}
+      HELIX_LLM_TLS_SKIP_VERIFY: ${HELIX_LLM_TLS_SKIP_VERIFY:-}
+
       # LLM Provider API Keys (optional for production)
       CLAUDE_API_KEY: ${CLAUDE_API_KEY:-}
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}

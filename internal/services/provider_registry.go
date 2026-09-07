@@ -1353,14 +1353,33 @@ func LoadRegistryConfigFromAppConfig(appConfig *config.Config) *RegistryConfig {
 		}
 	}
 
-	// Load provider configurations from environment variables
-	// Providers are only enabled if their API key is configured
+	// Load provider configurations from environment variables.
+	//
+	// Local-first default (spec 002, HA-F2-002): a credential present in the
+	// environment is NOT by itself consent to reach a cloud provider. This is
+	// the IMPLICIT acquisition path — the operator's shell / .env /
+	// docker-compose supplies a key and the process decides on its own to
+	// build a live client — so it obeys the same HELIX_CLOUD_PROVIDERS switch
+	// as registry auto-discovery and boot-time verifier discovery. An operator
+	// who names a provider explicitly in the registry config is NOT gated: that
+	// decision has already been made by hand.
+	//
+	// Without this, a key alone reached createProviderFromConfig's
+	// `cfg.Enabled && cfg.APIKey != ""` branch and constructed a live cloud
+	// client, which the chat handler's ListProvidersOrderedByScore fallback and
+	// the debate service's GetProvider(...) calls could then route to — while
+	// every switch reported "cloud disabled".
+	cloudOptIn := CloudProvidersOptedIn()
+	cloudEnabled := func(apiKey string) bool { return cloudOptIn && apiKey != "" }
+	if !cloudOptIn {
+		logrus.Debug("Cloud providers not opted in (HELIX_CLOUD_PROVIDERS unset/false): env-credentialed cloud providers stay disabled")
+	}
 
 	deepseekKey := os.Getenv("DEEPSEEK_API_KEY")
 	cfg.Providers["deepseek"] = &ProviderConfig{
 		Name:    "deepseek",
 		Type:    "deepseek",
-		Enabled: deepseekKey != "",
+		Enabled: cloudEnabled(deepseekKey),
 		Models: []ModelConfig{{
 			ID:      getEnvOrDefault("DEEPSEEK_MODEL", "deepseek-coder"),
 			Name:    "DeepSeek Coder",
@@ -1377,7 +1396,7 @@ func LoadRegistryConfigFromAppConfig(appConfig *config.Config) *RegistryConfig {
 	cfg.Providers["claude"] = &ProviderConfig{
 		Name:    "claude",
 		Type:    "claude",
-		Enabled: claudeKey != "",
+		Enabled: cloudEnabled(claudeKey),
 		Models: []ModelConfig{{
 			ID:      getEnvOrDefault("CLAUDE_MODEL", "claude-3-sonnet-20240229"),
 			Name:    "Claude 3 Sonnet",
@@ -1394,7 +1413,7 @@ func LoadRegistryConfigFromAppConfig(appConfig *config.Config) *RegistryConfig {
 	cfg.Providers["gemini"] = &ProviderConfig{
 		Name:    "gemini",
 		Type:    "gemini",
-		Enabled: geminiKey != "",
+		Enabled: cloudEnabled(geminiKey),
 		Models: []ModelConfig{{
 			ID:      getEnvOrDefault("GEMINI_MODEL", "gemini-pro"),
 			Name:    "Gemini Pro",
@@ -1411,7 +1430,7 @@ func LoadRegistryConfigFromAppConfig(appConfig *config.Config) *RegistryConfig {
 	cfg.Providers["qwen"] = &ProviderConfig{
 		Name:    "qwen",
 		Type:    "qwen",
-		Enabled: qwenKey != "",
+		Enabled: cloudEnabled(qwenKey),
 		Models: []ModelConfig{{
 			ID:      getEnvOrDefault("QWEN_MODEL", "qwen-turbo"),
 			Name:    "Qwen Turbo",
@@ -1428,7 +1447,7 @@ func LoadRegistryConfigFromAppConfig(appConfig *config.Config) *RegistryConfig {
 	cfg.Providers["openrouter"] = &ProviderConfig{
 		Name:    "openrouter",
 		Type:    "openrouter",
-		Enabled: openrouterKey != "",
+		Enabled: cloudEnabled(openrouterKey),
 		Models: []ModelConfig{{
 			ID:      getEnvOrDefault("OPENROUTER_MODEL", "x-ai/grok-4"),
 			Name:    "Grok-4 via OpenRouter",

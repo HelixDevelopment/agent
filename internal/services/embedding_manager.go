@@ -109,10 +109,29 @@ type EmbeddingConfig struct {
 	CacheEnabled   bool
 }
 
-// NewEmbeddingManager creates a new embedding manager
+// NewEmbeddingManager creates a new embedding manager.
+//
+// Local-first default (spec 002, HA-F2-002): OPENAI_API_KEY sitting in the
+// environment is NOT by itself consent to send text to OpenAI. This is the
+// same IMPLICIT acquisition path the provider registry and the boot-time
+// verifier gate, reached here through the wired
+// POST /v1/protocols/execute {"protocol_type":"embedding"} route
+// (router.go -> NewUnifiedProtocolManager -> NewEmbeddingManager), so it
+// consults the SAME predicate.
+//
+// Gating this degrades gracefully rather than failing: GenerateEmbedding
+// already falls back to generateLocalEmbedding when no key is configured,
+// which is exactly the local-first behaviour. An operator who wants cloud
+// embeddings either opts in via HELIX_CLOUD_PROVIDERS or supplies the key
+// explicitly through NewEmbeddingManagerWithConfig, which stays ungated.
 func NewEmbeddingManager(repo *database.ModelMetadataRepository, cache CacheInterface, log *logrus.Logger) *EmbeddingManager {
+	openAIKey := ""
+	if CloudProvidersOptedIn() {
+		openAIKey = os.Getenv("OPENAI_API_KEY")
+	}
+
 	return NewEmbeddingManagerWithConfig(repo, cache, log, EmbeddingConfig{
-		OpenAIAPIKey:   os.Getenv("OPENAI_API_KEY"),
+		OpenAIAPIKey:   openAIKey,
 		VectorProvider: "pgvector",
 		Timeout:        30 * time.Second,
 		CacheEnabled:   true,
