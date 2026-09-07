@@ -3881,12 +3881,21 @@ func (h *UnifiedHandler) processWithOrchestrator(ctx context.Context, req *model
 		)
 	}
 
+	// Report the usage the debate really consumed. Without this the envelope
+	// carried {0,0,0} beside a 200 on this path — the exact all-zero shape
+	// that cannot be distinguished from "no model ran". The counts are SUMMED
+	// from what each participant's provider reported (never derived, never
+	// halved); the per-direction split is published only when it accounts for
+	// the whole total, otherwise the total alone is reported.
+	debatePrompt, debateCompletion, debateTotal := services.DebateTokenTotals(debateResult)
 	finalResponse := &models.LLMResponse{
 		ID:           debateResult.DebateID,
 		Content:      finalContent,
 		Confidence:   confidence,
 		FinishReason: "stop",
 		CreatedAt:    time.Now(),
+		TokensUsed:   debateTotal,
+		Metadata:     services.DebateUsageMetadata(debatePrompt, debateCompletion, debateTotal),
 	}
 
 	return &services.EnsembleResult{

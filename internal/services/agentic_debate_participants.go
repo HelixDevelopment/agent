@@ -4,6 +4,8 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"dev.helix.agent/internal/models"
 )
 
 // Ensemble debate participant wiring (spec 002 / HA-F2-003).
@@ -74,25 +76,80 @@ const (
 // participant. A participant whose provider reported nothing contributes 0 —
 // the total is never padded or estimated (§11.4.6: report what was measured).
 func totalDebateTokens(dr *DebateResult) int {
+	_, _, total := DebateTokenTotals(dr)
+	return total
+}
+
+// DebateTokenTotals sums what every participant's provider ACTUALLY
+// reported, in all three directions.
+//
+// Why the split and not just the total: a debate's OpenAI-compatible
+// envelope is built from the selected response's TokenSplit(), so a
+// selected response carrying only an aggregate publishes
+// `prompt_tokens: 0, completion_tokens: 0` beside a real `total_tokens`.
+// That was the live shape measured 2026-09-07 on POST /v1/chat/completions
+// with model=helixagent-debate: `{"prompt_tokens":0,"completion_tokens":0,
+// "total_tokens":613}` next to the reply "Paris". The per-direction numbers
+// were never missing from the providers — they were simply never summed,
+// because ParticipantResponse.Metadata recorded only "tokens_used".
+//
+// Each participant contributes its OWN reported split, read through the
+// same models.LLMResponse.TokenSplit() contract the rest of the codebase
+// uses, so the two-naming-convention handling (OpenAI-shaped
+// prompt/completion, Anthropic-shaped input/output) and the numeric-type
+// tolerance are inherited rather than re-implemented here.
+//
+// A participant whose provider reported no split contributes 0 to both
+// directions while still contributing its total — so callers can detect
+// exactly that case by comparing prompt+completion against total, and MUST
+// NOT publish a split that does not account for the whole total (see
+// debateResultToEnsemble). Nothing here derives, halves, or otherwise
+// invents a direction (§11.4.6).
+func DebateTokenTotals(dr *DebateResult) (prompt, completion, total int) {
 	if dr == nil {
-		return 0
+		return 0, 0, 0
 	}
-	total := 0
 	for _, r := range dr.AllResponses {
 		if r.Metadata == nil {
 			continue
 		}
-		switch v := r.Metadata["tokens_used"].(type) {
-		case int:
-			total += v
-		case int64:
-			total += int(v)
-		case float64:
-			// Survives a JSON round-trip of the metadata map.
-			total += int(v)
+		// Reuse the canonical accessor by presenting this participant's
+		// recorded numbers in the shape it reads.
+		resp := &models.LLMResponse{
+			TokensUsed: metadataTokenCount(r.Metadata, "tokens_used"),
+			Metadata:   r.Metadata,
+		}
+		p, c, t := resp.TokenSplit()
+		prompt += p
+		completion += c
+		total += t
+	}
+	return prompt, completion, total
+}
+
+// metadataTokenCount reads a non-negative token count out of a participant
+// metadata map, tolerating the numeric types a value can take before and
+// after a JSON round-trip. An absent or unparseable value is 0 — reported
+// as "not reported", never guessed at.
+func metadataTokenCount(md map[string]any, key string) int {
+	if md == nil {
+		return 0
+	}
+	switch v := md[key].(type) {
+	case int:
+		if v > 0 {
+			return v
+		}
+	case int64:
+		if v > 0 {
+			return int(v)
+		}
+	case float64:
+		if v > 0 {
+			return int(v)
 		}
 	}
-	return total
+	return 0
 }
 
 // resolveDebateProvider returns the provider name the ensemble debate should

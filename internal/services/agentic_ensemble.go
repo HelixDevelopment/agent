@@ -294,6 +294,26 @@ func (e *AgenticEnsemble) agenticExecutionLoop(
 
 	toolSummary := e.buildToolSummary(allToolExecs)
 
+	// Carry forward the token usage this run really consumed, rather than
+	// emitting {0,0,0} beside a 200 — the all-zero shape that is
+	// indistinguishable from "no model ran" and which made an actually-working
+	// execution look like a stub (measured 2026-09-07: an actionable prompt on
+	// model=helixagent-debate routed here and reported total_tokens=0 while the
+	// UNDERSTAND stage had genuinely run a full multi-participant debate).
+	//
+	// HONEST SCOPE (§11.4.6): the only stage that currently reports usage is
+	// Stage 1 UNDERSTAND, whose EnsembleResult carries the real summed
+	// per-participant counts. The agent workers (AgenticResult) and the
+	// verification debate do NOT propagate token usage at all — AgenticResult
+	// has no usage field — so this figure accounts for the UNDERSTAND stage
+	// only and is a FLOOR on the run's true consumption, not its total. It is
+	// reported as such (usage_scope below) rather than padded with an estimate
+	// for the stages that report nothing.
+	var uPrompt, uCompletion, uTotal int
+	if understandResult != nil && understandResult.Selected != nil {
+		uPrompt, uCompletion, uTotal = understandResult.Selected.TokenSplit()
+	}
+
 	ensembleResult := &EnsembleResult{
 		Selected: &models.LLMResponse{
 			ID:           fmt.Sprintf("ae-%s", uuid.New().String()[:8]),
@@ -301,9 +321,13 @@ func (e *AgenticEnsemble) agenticExecutionLoop(
 			ProviderName: "agentic-ensemble",
 			Confidence:   e.calculateConfidence(verification),
 			ResponseTime: time.Since(startTime).Milliseconds(),
+			TokensUsed:   uTotal,
+			Metadata:     DebateUsageMetadata(uPrompt, uCompletion, uTotal),
 		},
 		VotingMethod: "agentic_execution",
 		Metadata: map[string]any{
+			"usage_scope": "understand_stage_only: agent-worker and verification " +
+				"stages do not report token usage; reported counts are a floor",
 			"agentic": &AgenticMetadata{
 				Mode:            AgenticModeExecute.String(),
 				StagesCompleted: stagesCompleted,
@@ -568,6 +592,34 @@ func (e *AgenticEnsemble) extractContent(
 	return ""
 }
 
+// DebateUsageMetadata turns the summed per-participant token counts into the
+// metadata map models.LLMResponse.TokenSplit reads, so the debate's
+// OpenAI-compatible envelope reports the REAL aggregated split instead of
+// zeros beside a real total.
+//
+// The completeness condition is load-bearing. TokenSplit treats a reported
+// pair as authoritative and derives the total from it, so publishing a split
+// that does not account for the whole total would silently SHRINK the total —
+// dropping the tokens of every participant whose provider reported no split.
+// The split is therefore published only when the summed directions account
+// for the summed total exactly; otherwise the honest answer is the total
+// alone, which is what an unreported direction means (§11.4.6).
+func DebateUsageMetadata(prompt, completion, total int) map[string]interface{} {
+	if total <= 0 {
+		return nil
+	}
+	if prompt <= 0 || completion <= 0 || prompt+completion != total {
+		// At least one participant reported no split (or a partial one).
+		// Report the total only — never a figure that cannot be justified.
+		return nil
+	}
+	return map[string]interface{}{
+		"prompt_tokens":     prompt,
+		"completion_tokens": completion,
+		"total_tokens":      total,
+	}
+}
+
 // debateResultToEnsemble converts a DebateResult into an EnsembleResult.
 func (e *AgenticEnsemble) debateResultToEnsemble(
 	dr *DebateResult,
@@ -583,7 +635,8 @@ func (e *AgenticEnsemble) debateResultToEnsemble(
 	// Without this the OpenAI-compatible envelope reported usage {0,0,0}
 	// alongside a 200, which is itself a tell that no model ran
 	// (convertToOpenAIChatResponse derives usage from Selected.TokenSplit()).
-	debateTokens := totalDebateTokens(dr)
+	debatePrompt, debateCompletion, debateTokens := DebateTokenTotals(dr)
+	usageMeta := DebateUsageMetadata(debatePrompt, debateCompletion, debateTokens)
 
 	var selectedResp *models.LLMResponse
 	if dr.BestResponse != nil {
@@ -594,6 +647,7 @@ func (e *AgenticEnsemble) debateResultToEnsemble(
 			Confidence:   dr.BestResponse.QualityScore,
 			ResponseTime: dr.Duration.Milliseconds(),
 			TokensUsed:   debateTokens,
+			Metadata:     usageMeta,
 		}
 	} else if dr.Consensus != nil && dr.Consensus.FinalPosition != "" {
 		selectedResp = &models.LLMResponse{
@@ -603,6 +657,7 @@ func (e *AgenticEnsemble) debateResultToEnsemble(
 			Confidence:   dr.Consensus.Confidence,
 			ResponseTime: dr.Duration.Milliseconds(),
 			TokensUsed:   debateTokens,
+			Metadata:     usageMeta,
 		}
 	}
 

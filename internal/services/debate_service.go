@@ -164,6 +164,105 @@ func IsSuspiciouslyFastResponse(responseTime time.Duration, contentLength int) b
 	return responseTime < 100*time.Millisecond && contentLength < 100
 }
 
+// IsNonGenuineFastResponse is the guard the debate loop applies to a
+// participant reply, and the successor to using IsSuspiciouslyFastResponse
+// directly at that call site.
+//
+// WHAT THE ORIGINAL GUARD WAS FOR (git-history FACT, §11.4.124). The
+// latency+length predicate arrived in commit 5d5dbb7b ("Add OAuth CLI
+// fallback providers and canned response detection") as the SIBLING of
+// IsCannedErrorResponse, under the heading "Canned Response Detection":
+//
+//	"Add exported IsSuspiciouslyFastResponse() helper (<100ms + <100 chars)
+//	 - Trigger fallback mechanism on canned/suspicious responses"
+//
+// Its own comment states the target: "typically indicates cached error or
+// non-genuine response". So the question it exists to answer is NOT "was
+// this fast?" — it is "did the provider actually DO any work, or did it
+// hand back a canned/cached string?"
+//
+// WHY LATENCY ALONE ANSWERS THAT QUESTION WRONGLY HERE. Wall-clock is a
+// proxy for "work happened" that only holds for a REMOTE provider, where
+// network round-trip alone already exceeds 100 ms. For a provider serving
+// a model on loopback the proxy inverts: a genuine generation from a local
+// 3B model is legitimately faster than the threshold. Measured live on
+// this stack (journalctl, 2026-09-07), the local `helixllm` provider
+// answering "What is the capital of France?" was REJECTED four times over:
+//
+//	response_preview=Paris response_time_ms=82 content_length=5
+//	response_preview=Paris response_time_ms=78 content_length=5
+//	response_preview=Paris response_time_ms=57 content_length=5
+//	response_preview=Paris response_time_ms=71 content_length=5
+//
+// Each rejection was reported upward as a participant FAILURE ("Primary LLM
+// failed, attempting fallback chain" → "[EXHAUSTED] All 0 fallbacks
+// failed"), so a correct answer became a failed debate.
+//
+// THE DISCRIMINATOR THAT ACTUALLY WORKS. The provider itself reports how
+// much work it did: the token usage on the response. A cached/canned string
+// handed back without inference carries no usage; a real generation carries
+// real counts (the same live capture shows tokens_used=206/277/298 beside
+// those 5-character replies). Reported usage is therefore a DIRECT signal
+// of "work happened", where latency is only an indirect one — and unlike
+// latency it does not depend on where the model runs.
+//
+// So the guard fires only when all three hold: the reply came back fast
+// AND it is short AND the provider reported NO tokens. That keeps exactly
+// what commit 5d5dbb7b was built to catch — the work-less canned/cached
+// reply — while no longer rejecting a genuine local answer. It composes
+// with, and does not replace, the two content-based checks that run ahead
+// of it at the call site: empty-response and IsCannedErrorResponse.
+//
+// Honest boundary (§11.4.6): this narrows the guard, it does not make it
+// omniscient. A provider that replays a cached response TOGETHER with
+// cached usage counts would satisfy the usage test and pass. That case is
+// not detectable from the response envelope at all, and the empty/canned
+// content checks remain the defence against it — inventing a latency floor
+// for a local endpoint would not catch it either, and would go back to
+// rejecting correct answers.
+func IsNonGenuineFastResponse(responseTime time.Duration, contentLength int, reportedTokens int) bool {
+	if reportedTokens > 0 {
+		// The provider accounted for real work. Whatever the latency, this
+		// is not the work-less canned/cached reply the guard targets.
+		return false
+	}
+	return IsSuspiciouslyFastResponse(responseTime, contentLength)
+}
+
+// participantUsageMetadata records what the provider ACTUALLY reported about
+// this participant call — the aggregate AND, when the provider supplied them,
+// the per-direction counts — into the ParticipantResponse metadata map.
+//
+// Before this, only "tokens_used" was carried forward. The per-direction
+// numbers most providers under internal/llm/providers record (OpenAI-shaped
+// prompt_tokens/completion_tokens, Anthropic-shaped input_tokens/output_tokens)
+// were dropped here, so nothing downstream could sum them and the debate's
+// OpenAI envelope published a zero split beside a real total. Aggregation of
+// the real numbers is the fix; a synthesised split would not be (§11.4.6 —
+// models.LLMResponse.TokenSplit deliberately refuses to invent one, and this
+// function must not smuggle one in behind it).
+//
+// A provider that reported no split contributes nothing here beyond the
+// aggregate, which is the honest answer for that participant.
+func participantUsageMetadata(resp *models.LLMResponse, extra map[string]any) map[string]any {
+	md := make(map[string]any, len(extra)+3)
+	for k, v := range extra {
+		md[k] = v
+	}
+	if resp == nil {
+		md["tokens_used"] = 0
+		return md
+	}
+
+	prompt, completion, total := resp.TokenSplit()
+	md["tokens_used"] = total
+	if prompt > 0 || completion > 0 {
+		md["prompt_tokens"] = prompt
+		md["completion_tokens"] = completion
+	}
+	return md
+}
+
 // NewDebateService creates a new debate service
 func NewDebateService(logger *logrus.Logger) *DebateService {
 	ds := &DebateService{
@@ -1374,23 +1473,31 @@ func (ds *DebateService) getParticipantResponse(
 		return ParticipantResponse{}, fmt.Errorf("[%s] canned error response from LLM (pattern: %s) - fallback required", participantIdentifier, matchedPattern)
 	}
 
-	// CRITICAL: Check for suspiciously fast responses (< 100ms typically indicates cached error)
-	if IsSuspiciouslyFastResponse(responseTime, len(llmResponse.Content)) {
+	// CRITICAL: Check for a fast, short reply that the provider did NOT
+	// account for with any token usage — the work-less cached/canned reply
+	// commit 5d5dbb7b built this guard for. A fast, short reply that DOES
+	// carry real usage is a genuine local generation and passes; see
+	// IsNonGenuineFastResponse for the measured evidence behind that split.
+	if IsNonGenuineFastResponse(responseTime, len(llmResponse.Content), llmResponse.TokensUsed) {
 		ds.logger.WithFields(logrus.Fields{
 			"participant":      participantIdentifier,
 			"provider":         participant.LLMProvider,
 			"model":            participant.LLMModel,
 			"response_time_ms": responseTime.Milliseconds(),
 			"content_length":   len(llmResponse.Content),
+			"tokens_used":      llmResponse.TokensUsed,
 			"response_preview": llmResponse.Content,
-		}).Warn("Suspiciously fast response detected - may be cached error, triggering fallback")
+		}).Warn("Fast, short reply with NO reported token usage - likely cached/canned, triggering fallback")
 
 		if ds.commLogger != nil {
 			ds.commLogger.LogError(participant.Role, participant.LLMProvider, participant.LLMModel,
-				fmt.Errorf("suspiciously fast response (%v, %d chars)", responseTime, len(llmResponse.Content)))
+				fmt.Errorf("fast, short reply with no reported token usage (%v, %d chars, 0 tokens)",
+					responseTime, len(llmResponse.Content)))
 		}
 
-		return ParticipantResponse{}, fmt.Errorf("[%s] suspiciously fast response (%v) - fallback required", participantIdentifier, responseTime)
+		return ParticipantResponse{}, fmt.Errorf(
+			"[%s] fast, short reply with no reported token usage (%v, %d chars) - fallback required",
+			participantIdentifier, responseTime, len(llmResponse.Content))
 	}
 
 	// Calculate quality score for this response
@@ -1435,12 +1542,11 @@ func (ds *DebateService) getParticipantResponse(
 		LLMModel:        participant.LLMModel,
 		LLMName:         participant.LLMModel,
 		Timestamp:       startTime,
-		Metadata: map[string]any{
-			"tokens_used":   llmResponse.TokensUsed,
+		Metadata: participantUsageMetadata(llmResponse, map[string]any{
 			"finish_reason": llmResponse.FinishReason,
 			"provider_id":   llmResponse.ProviderID,
 			"response_time": llmResponse.ResponseTime,
-		},
+		}),
 	}
 
 	// Add Cognee analysis if enabled
@@ -3103,13 +3209,12 @@ func (ds *DebateService) getSingleProviderParticipantResponse(
 		LLMModel:        participant.LLMModel,
 		LLMName:         participant.LLMModel,
 		Timestamp:       startTime,
-		Metadata: map[string]any{
-			"tokens_used":       llmResponse.TokensUsed,
+		Metadata: participantUsageMetadata(llmResponse, map[string]any{
 			"finish_reason":     llmResponse.FinishReason,
 			"single_provider":   true,
 			"temperature_used":  temp,
 			"system_prompt_len": len(systemPrompt),
-		},
+		}),
 	}, nil
 }
 
