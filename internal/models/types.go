@@ -204,7 +204,12 @@ func (r *LLMResponse) TokenSplit() (prompt, completion, total int) {
 		// EXPLICIT total_tokens key, never from the bare TokensUsed
 		// aggregate — see the contract above for why the two are not
 		// interchangeable.
-		known := promptVal + completionVal // exactly one is non-zero here
+		// Exactly ONE direction was reported. Its value may itself be a
+		// measured zero (a provider may report `prompt_tokens: 0` alone), so
+		// this sum is "the measurement we have", not "the non-zero one" —
+		// the unreported direction contributes 0 because it is absent, not
+		// because it was measured as 0.
+		known := promptVal + completionVal
 
 		// Floor the total at the part we measured: a total smaller than
 		// one of its own parts is impossible, so a smaller aggregate is

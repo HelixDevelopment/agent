@@ -100,11 +100,29 @@ func totalDebateTokens(dr *DebateResult) int {
 // tolerance are inherited rather than re-implemented here.
 //
 // A participant whose provider reported no split contributes 0 to both
-// directions while still contributing its total — so callers can detect
-// exactly that case by comparing prompt+completion against total, and MUST
-// NOT publish a split that does not account for the whole total (see
-// debateResultToEnsemble). Nothing here derives, halves, or otherwise
-// invents a direction (§11.4.6).
+// directions while still contributing its total; a participant that reported
+// only ONE direction contributes that real measurement plus its full
+// aggregate. USUALLY the summed directions then fall short of the summed
+// total, and callers MUST NOT publish a split that does not account for the
+// whole total (see DebateUsageMetadata, which withholds it).
+//
+// That shortfall is NOT guaranteed, and saying it were would assert an
+// invariant this code does not enforce. At the boundary where a partial
+// participant's aggregate is <= its one measured direction, TokenSplit
+// returns total == that direction (it never places a total below a part), so
+// that participant contributes NO shortfall: the sums can match while a
+// direction is still genuinely unknown, and DebateUsageMetadata will then
+// PUBLISH a split that books the unknown direction as a measured 0. Measured:
+// a full 200/6/206 participant beside a partial one whose prompt is 7 and
+// whose aggregate is 7 yields totals (207,6,213) with the sums agreeing.
+// That is pre-existing DebateUsageMetadata policy, not something introduced
+// with this accessor, and it is recorded here rather than papered over.
+//
+// The converse does not hold either: prompt+completion == total does not
+// prove every participant reported a split, only that the reported ones
+// happen to add up — so that comparison identifies when a split is
+// UNPUBLISHABLE, never how many participants were partial. Nothing here
+// derives, halves, or otherwise invents a direction (§11.4.6).
 func DebateTokenTotals(dr *DebateResult) (prompt, completion, total int) {
 	if dr == nil {
 		return 0, 0, 0

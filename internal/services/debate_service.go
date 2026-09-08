@@ -244,6 +244,34 @@ func IsNonGenuineFastResponse(responseTime time.Duration, contentLength int, rep
 //
 // A provider that reported no split contributes nothing here beyond the
 // aggregate, which is the honest answer for that participant.
+//
+// ENCODE/DECODE ROUND-TRIP INVARIANT (load-bearing). What this function
+// writes is read back through the SAME TokenSplit contract by
+// DebateTokenTotals, so the encode MUST be stable: for every triple
+// TokenSplit can return, encoding it here and decoding it there yields that
+// same triple. Two rules keep it stable, and each exists because breaking it
+// SHRANK a real total:
+//
+//  1. A direction key is written only for a direction that is actually
+//     REPORTED (non-zero). TokenSplit returns plain ints, so a MEASURED zero
+//     and an UNKNOWN direction look identical in its result — but the two are
+//     NOT interchangeable in the metadata map. Writing an explicit
+//     `completion_tokens: 0` for a PARTIAL report (7, 0, 41) puts two keys in
+//     the map, which sends the decode down the both-known branch where the
+//     parts are authoritative and the total is derived as 7+0=7 — the
+//     41-token aggregate is silently discarded (`tokens_used` is not the key
+//     `total_tokens`, so it is never consulted there). Omitting the unreported
+//     direction keeps the decode on the partial branch, which recovers the
+//     aggregate and re-derives that direction as 0 — the SAME value the
+//     explicit zero carried. So omitting costs nothing observable in the
+//     triple, while writing the zero costs real tokens.
+//
+//  2. No explicit `total_tokens` is written. On the partial branch an explicit
+//     total is treated as authoritative and the MISSING direction is solved
+//     for: emitting `prompt_tokens:7, total_tokens:41` would decode as
+//     (7, 34, 41), inventing a 34 nobody measured (§11.4.6). The aggregate
+//     therefore travels in `tokens_used`, which the partial branch uses only
+//     as a floor and never as licence to derive a direction.
 func participantUsageMetadata(resp *models.LLMResponse, extra map[string]any) map[string]any {
 	md := make(map[string]any, len(extra)+3)
 	for k, v := range extra {
@@ -256,8 +284,10 @@ func participantUsageMetadata(resp *models.LLMResponse, extra map[string]any) ma
 
 	prompt, completion, total := resp.TokenSplit()
 	md["tokens_used"] = total
-	if prompt > 0 || completion > 0 {
+	if prompt > 0 {
 		md["prompt_tokens"] = prompt
+	}
+	if completion > 0 {
 		md["completion_tokens"] = completion
 	}
 	return md

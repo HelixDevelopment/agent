@@ -407,3 +407,184 @@ func TestDebateUsageMetadata_RoundTripsThroughTokenSplit(t *testing.T) {
 			p, c, tot)
 	}
 }
+
+// --------------------------------------------------------------------------
+// Defect 3 (§11.4.115 RED, review finding against 45457735) — the participant
+// metadata ENCODE is lossy, so a PARTIAL provider report shrinks the debate's
+// published total.
+//
+// TokenSplit returns plain ints, so a MEASURED zero and an UNKNOWN direction
+// are indistinguishable in its return value. participantUsageMetadata
+// re-encoded that triple by writing BOTH direction keys whenever EITHER was
+// non-zero, so a partial report (7, 0, 41) was written as
+// `prompt_tokens:7, completion_tokens:0, tokens_used:41`. Reading it back,
+// TokenSplit sees two present keys, takes the both-known branch, treats the
+// parts as authoritative and derives total = 7 + 0 = 7 — the 41-token
+// aggregate is discarded (`tokens_used` is not the key `total_tokens`, so it
+// is never consulted on that branch).
+//
+// Measured on 45457735, same code both trees:
+//
+//	prefix: TokenSplit=(0,0,41)  metadata=map[tokens_used:41]
+//	        DebateTokenTotals=(0,0,41)
+//	head:   TokenSplit=(7,0,41)  metadata=map[completion_tokens:0
+//	        prompt_tokens:7 tokens_used:41]   DebateTokenTotals=(7,0,7)
+//
+// End to end through debateResultToEnsemble with one full participant
+// (200/6/206) and one partial one (prompt 7, aggregate 41), true total 247:
+//
+//	prefix: wire usage prompt=0   completion=0 total=247
+//	head:   wire usage prompt=207 completion=6 total=213  -> 34 tokens dropped
+//
+// That is precisely the "silently SHRINK the total" failure DebateUsageMetadata's
+// own comment forbids; the completeness guard there is bypassed because the
+// shrink happens UPSTREAM of it, in the per-participant re-encode.
+// --------------------------------------------------------------------------
+
+// participantFromProviderResponse builds a ParticipantResponse the way the
+// live debate path does — through participantUsageMetadata — so the test
+// exercises the real ENCODE hop instead of hand-writing the metadata map.
+func participantFromProviderResponse(id string, resp *models.LLMResponse) ParticipantResponse {
+	return ParticipantResponse{
+		ParticipantID: id,
+		Content:       "Paris",
+		Metadata:      participantUsageMetadata(resp, nil),
+	}
+}
+
+func TestDebateEnsembleUsage_PartialParticipantDoesNotShrinkTotal(t *testing.T) {
+	// p1: a provider that reported BOTH directions.
+	full := &models.LLMResponse{
+		TokensUsed: 206,
+		Metadata:   map[string]interface{}{"prompt_tokens": 200, "completion_tokens": 6},
+	}
+	// p2: a provider that reported ONE direction plus an aggregate — the
+	// legacy-persisted / partially-parsed shape 45457735 exists to preserve.
+	partial := &models.LLMResponse{
+		TokensUsed: 41,
+		Metadata:   map[string]interface{}{"prompt_tokens": 7},
+	}
+
+	best := participantFromProviderResponse("p1", full)
+	dr := &DebateResult{
+		DebateID:     "partial-participant-total",
+		BestResponse: &best,
+		AllResponses: []ParticipantResponse{
+			participantFromProviderResponse("p1", full),
+			participantFromProviderResponse("p2", partial),
+		},
+	}
+
+	// 206 real tokens from p1 + 41 real tokens from p2. Not one may vanish.
+	const wantTotal = 247
+
+	e := &AgenticEnsemble{}
+	result := e.debateResultToEnsemble(dr, AgenticModeReason)
+	if result == nil || result.Selected == nil {
+		t.Fatal("debateResultToEnsemble returned no selected response")
+	}
+	prompt, completion, total := result.Selected.TokenSplit()
+
+	if redMode() {
+		if total == wantTotal {
+			t.Fatalf("RED_MODE=1: expected the PRE-FIX envelope to UNDER-REPORT the "+
+				"total, got prompt=%d completion=%d total=%d — the defect is not "+
+				"present on this artifact", prompt, completion, total)
+		}
+		t.Logf("RED confirmed: envelope reports prompt=%d completion=%d total=%d "+
+			"while the participants really consumed %d tokens (%d dropped)",
+			prompt, completion, total, wantTotal, wantTotal-total)
+		return
+	}
+
+	if total != wantTotal {
+		t.Fatalf("GREEN: the published total must account for every participant's "+
+			"real tokens: got total=%d (prompt=%d completion=%d), want %d",
+			total, prompt, completion, wantTotal)
+	}
+	// And whatever split IS published must account for that whole total —
+	// the invariant DebateUsageMetadata exists to hold.
+	if (prompt != 0 || completion != 0) && prompt+completion != total {
+		t.Fatalf("GREEN: a published split must account for the whole total: "+
+			"got prompt=%d completion=%d total=%d", prompt, completion, total)
+	}
+}
+
+// The property that makes the defect above impossible by construction: the
+// participant metadata ENCODE must be round-trip stable. For EVERY triple
+// TokenSplit can return, encoding it via participantUsageMetadata and reading
+// it back via TokenSplit (the exact hop DebateTokenTotals performs) MUST yield
+// the same triple. Nothing may be added, erased, or re-derived in between.
+func TestParticipantUsageMetadata_RoundTripsEveryTokenSplitShape(t *testing.T) {
+	cases := []struct {
+		name      string
+		provider  *models.LLMResponse
+		rationale string
+	}{
+		{"both-directions-reported",
+			&models.LLMResponse{TokensUsed: 206, Metadata: map[string]interface{}{
+				"prompt_tokens": 200, "completion_tokens": 6}},
+			"the ordinary complete report"},
+		{"prompt-only-with-aggregate",
+			&models.LLMResponse{TokensUsed: 41, Metadata: map[string]interface{}{
+				"prompt_tokens": 7}},
+			"the partial shape that shrank the total"},
+		{"completion-only-with-aggregate",
+			&models.LLMResponse{TokensUsed: 41, Metadata: map[string]interface{}{
+				"completion_tokens": 34}},
+			"the mirror-image partial shape"},
+		{"neither-direction-aggregate-only",
+			&models.LLMResponse{TokensUsed: 300},
+			"nothing to preserve but the aggregate"},
+		{"measured-zero-prompt-alongside-real-completion",
+			&models.LLMResponse{TokensUsed: 50, Metadata: map[string]interface{}{
+				"prompt_tokens": 0, "completion_tokens": 50}},
+			"a genuinely measured zero must not change the decoded triple"},
+		{"measured-zero-completion-alongside-real-prompt",
+			&models.LLMResponse{TokensUsed: 50, Metadata: map[string]interface{}{
+				"prompt_tokens": 50, "completion_tokens": 0}},
+			"same, mirrored"},
+		{"both-directions-measured-zero",
+			&models.LLMResponse{Metadata: map[string]interface{}{
+				"prompt_tokens": 0, "completion_tokens": 0}},
+			"an all-zero report survives as all-zero"},
+		{"anthropic-shaped-partial",
+			&models.LLMResponse{TokensUsed: 41, Metadata: map[string]interface{}{
+				"input_tokens": 7}},
+			"the alias naming convention takes the same path"},
+		{"json-round-tripped-floats",
+			&models.LLMResponse{TokensUsed: 206, Metadata: map[string]interface{}{
+				"prompt_tokens": float64(200), "completion_tokens": float64(6)}},
+			"metadata that survived a JSON hop carries float64"},
+		{"explicit-consistent-total",
+			&models.LLMResponse{TokensUsed: 206, Metadata: map[string]interface{}{
+				"prompt_tokens": 200, "completion_tokens": 6, "total_tokens": 206}},
+			"an explicit total that agrees with the parts"},
+		{"nil-response",
+			nil,
+			"no provider response at all"},
+	}
+
+	for _, tc := range cases {
+		wantPrompt, wantCompletion, wantTotal := tc.provider.TokenSplit()
+
+		md := participantUsageMetadata(tc.provider, nil)
+
+		// The exact hop DebateTokenTotals performs to read a participant back.
+		decoded := &models.LLMResponse{
+			TokensUsed: metadataTokenCount(md, "tokens_used"),
+			Metadata:   md,
+		}
+		gotPrompt, gotCompletion, gotTotal := decoded.TokenSplit()
+
+		if gotPrompt != wantPrompt || gotCompletion != wantCompletion || gotTotal != wantTotal {
+			t.Errorf("case %s: encode/decode changed the triple: got (%d,%d,%d), "+
+				"want (%d,%d,%d) — metadata=%v — %s",
+				tc.name, gotPrompt, gotCompletion, gotTotal,
+				wantPrompt, wantCompletion, wantTotal, md, tc.rationale)
+			continue
+		}
+		t.Logf("case %-46s (%d,%d,%d) stable  %s",
+			tc.name, gotPrompt, gotCompletion, gotTotal, tc.rationale)
+	}
+}
