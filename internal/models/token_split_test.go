@@ -116,44 +116,59 @@ func TestLLMResponse_TokenSplit(t *testing.T) {
 			wantPrompt: 0, wantCompletion: 0, wantTotal: 41,
 		},
 		{
-			// Partial report WITH a usable aggregate: the missing
-			// direction is DERIVED as total − known. That is
-			// arithmetic, not invention — the OpenAI usage schema
-			// defines total = prompt + completion, so two knowns
-			// determine the third. 41 − 7 = 34.
-			name: "only_prompt_reported_derives_completion_from_total",
+			// RECONCILED 2026-09-08 (§11.4.120). Now asserts: the
+			// reported direction survives verbatim (7), the missing one
+			// stays unknown (0), and the bare aggregate becomes the total.
+			//
+			// This case previously demanded completion=34 be DERIVED as
+			// 41 − 7 from the bare TokensUsed aggregate. That derivation
+			// is unsafe and was correctly refused by the accessor:
+			// TokensUsed has no total-semantics guarantee (the
+			// pre-2026-09-03 claude provider stored the OUTPUT count
+			// there, and those rows are persisted + reloaded), so on a
+			// legacy row the "arithmetic" publishes a fabricated number.
+			// Only an EXPLICIT total_tokens key licenses the subtraction
+			// — see partial_report_with_explicit_total_derives_the_rest.
+			name: "only_prompt_reported_survives_without_derivation",
 			resp: &LLMResponse{
 				TokensUsed: 41,
 				Metadata: map[string]interface{}{
 					"prompt_tokens": 7,
 				},
 			},
-			wantPrompt: 7, wantCompletion: 34, wantTotal: 41,
+			wantPrompt: 7, wantCompletion: 0, wantTotal: 41,
 		},
 		{
-			// Same rule in the other direction.
-			name: "only_completion_reported_derives_prompt_from_total",
+			// Same rule in the other direction: the measured completion
+			// side is kept, the unmeasured prompt side stays 0.
+			name: "only_completion_reported_survives_without_derivation",
 			resp: &LLMResponse{
 				TokensUsed: 41,
 				Metadata: map[string]interface{}{
 					"completion_tokens": 34,
 				},
 			},
-			wantPrompt: 7, wantCompletion: 34, wantTotal: 41,
+			wantPrompt: 0, wantCompletion: 34, wantTotal: 41,
 		},
 		{
-			// The aggregate cannot be smaller than one of its parts, so
-			// it is not a true total and the relationship between these
-			// numbers is unknown. Report neither direction rather than
-			// deriving a negative or otherwise unjustifiable figure.
-			name: "aggregate_smaller_than_known_part_yields_zeros",
+			// RECONCILED 2026-09-08 (§11.4.120). Now asserts: a malformed
+			// aggregate is discarded, the measurement is kept.
+			//
+			// This case previously expected (0, 0, 3) — it threw away the
+			// good measured datum (prompt=7) and published the bad one
+			// (total=3) instead. That is backwards: a total smaller than
+			// a part it contains is impossible, which makes the AGGREGATE
+			// the untrustworthy value, not the measurement. The total
+			// falls back to the known part so the envelope cannot
+			// self-contradict.
+			name: "malformed_smaller_aggregate_is_discarded_not_the_measurement",
 			resp: &LLMResponse{
 				TokensUsed: 3,
 				Metadata: map[string]interface{}{
 					"prompt_tokens": 7,
 				},
 			},
-			wantPrompt: 0, wantCompletion: 0, wantTotal: 3,
+			wantPrompt: 7, wantCompletion: 0, wantTotal: 7,
 		},
 		{
 			// Partial report with no aggregate at all: the one known
@@ -201,10 +216,21 @@ func TestLLMResponse_TokenSplit(t *testing.T) {
 			wantPrompt: 7, wantCompletion: 34, wantTotal: 41,
 		},
 		{
-			// A legacy/stored response predating that provider fix
-			// carries input_tokens only. The derive rule recovers the
-			// output side from the aggregate instead of reporting 0.
-			name: "legacy_input_only_derives_output_from_aggregate",
+			// RECONCILED 2026-09-08 (§11.4.120). Now asserts: the measured
+			// input side survives, the output side stays unknown.
+			//
+			// A legacy/stored response predating that provider fix carries
+			// input_tokens only. This case previously expected the output
+			// side to be recovered as 41 − 7 = 34 from the aggregate —
+			// which happens to look right ONLY because this fixture's
+			// TokensUsed is a true total. On a genuine legacy row it is
+			// not: `git show eaa73056^:internal/llm/providers/claude/
+			// claude.go` sets TokensUsed to Usage.OutputTokens, so the
+			// real shape is input=7 / TokensUsed=34, and the same
+			// subtraction publishes 7/27/34 against a truth of 7/34/41.
+			// The accessor cannot tell the two shapes apart, so it must
+			// not derive from either.
+			name: "legacy_input_only_survives_without_derivation",
 			resp: &LLMResponse{
 				TokensUsed: 41,
 				Metadata: map[string]interface{}{
@@ -212,7 +238,118 @@ func TestLLMResponse_TokenSplit(t *testing.T) {
 					"input_tokens": 7,
 				},
 			},
+			wantPrompt: 7, wantCompletion: 0, wantTotal: 41,
+		},
+		{
+			// The genuine legacy-claude row the comment above describes,
+			// asserted directly: TokensUsed holds the OUTPUT count, so it
+			// is not a total at all. The prompt side (measured) survives;
+			// nothing is invented for the output side.
+			name: "legacy_claude_row_where_tokensused_is_the_output_count",
+			resp: &LLMResponse{
+				TokensUsed: 34,
+				Metadata: map[string]interface{}{
+					"model":        "claude-x",
+					"input_tokens": 7,
+				},
+			},
+			wantPrompt: 7, wantCompletion: 0, wantTotal: 34,
+		},
+		{
+			// The ONLY licensed derivation: an explicit total_tokens key
+			// is written solely by a provider that parsed a real usage
+			// object, so total = prompt + completion holds by
+			// construction and the third quantity is determined. 41−7=34.
+			name: "partial_report_with_explicit_total_derives_the_rest",
+			resp: &LLMResponse{
+				TokensUsed: 41,
+				Metadata: map[string]interface{}{
+					"prompt_tokens": 7,
+					"total_tokens":  41,
+				},
+			},
 			wantPrompt: 7, wantCompletion: 34, wantTotal: 41,
+		},
+		{
+			// Same, other direction, and with no TokensUsed at all — the
+			// explicit total stands alone.
+			name: "partial_completion_with_explicit_total_derives_prompt",
+			resp: &LLMResponse{
+				Metadata: map[string]interface{}{
+					"completion_tokens": 34,
+					"total_tokens":      41,
+				},
+			},
+			wantPrompt: 7, wantCompletion: 34, wantTotal: 41,
+		},
+		{
+			// A malformed EXPLICIT total (smaller than the measured part)
+			// licenses no derivation either. The measurement survives and
+			// the total falls back to the usable aggregate.
+			name: "explicit_total_smaller_than_known_part_derives_nothing",
+			resp: &LLMResponse{
+				TokensUsed: 41,
+				Metadata: map[string]interface{}{
+					"prompt_tokens": 7,
+					"total_tokens":  3,
+				},
+			},
+			wantPrompt: 7, wantCompletion: 0, wantTotal: 41,
+		},
+		{
+			// Boundary: an explicit total EQUAL to the known part is
+			// well-formed, and determines the missing direction as
+			// exactly zero — a measured zero, not an unknown.
+			name: "explicit_total_equal_to_known_part_yields_zero_completion",
+			resp: &LLMResponse{
+				TokensUsed: 7,
+				Metadata: map[string]interface{}{
+					"prompt_tokens": 7,
+					"total_tokens":  7,
+				},
+			},
+			wantPrompt: 7, wantCompletion: 0, wantTotal: 7,
+		},
+		{
+			// Anthropic-shaped partial report resolves identically — the
+			// alias set is read for the total key's siblings too.
+			name: "anthropic_partial_output_only_survives",
+			resp: &LLMResponse{
+				TokensUsed: 41,
+				Metadata: map[string]interface{}{
+					"output_tokens": 34,
+				},
+			},
+			wantPrompt: 0, wantCompletion: 34, wantTotal: 41,
+		},
+		{
+			// A partial report whose sibling direction is present but
+			// UNPARSEABLE is still a partial report: the good value
+			// survives, the garbage one is treated as absent, never
+			// guessed at.
+			name: "partial_with_unparseable_sibling_keeps_the_good_value",
+			resp: &LLMResponse{
+				TokensUsed: 41,
+				Metadata: map[string]interface{}{
+					"prompt_tokens":     7,
+					"completion_tokens": "not-a-number",
+				},
+			},
+			wantPrompt: 7, wantCompletion: 0, wantTotal: 41,
+		},
+		{
+			// Zero is a legal measured value. A reported prompt_tokens=0
+			// alongside a real completion count must not be mistaken for
+			// "unreported" — the completion side still survives.
+			name: "zero_valued_reported_direction_is_not_a_missing_one",
+			resp: &LLMResponse{
+				TokensUsed: 34,
+				Metadata: map[string]interface{}{
+					"prompt_tokens":     0,
+					"completion_tokens": 34,
+				},
+			},
+			wantPrompt: 0, wantCompletion: 34, wantTotal: 34,
 		},
 		{
 			// OpenAI-shaped keys win over Anthropic aliases when both

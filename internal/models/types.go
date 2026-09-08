@@ -140,16 +140,35 @@ type LLMResponse struct {
 //     determined. Guarded by total >= known so a malformed total can
 //     never produce a negative count.
 //   - Exactly ONE direction reported, with only the struct's
-//     TokensUsed aggregate ⇒ report (0, 0, TokensUsed). The derivation
-//     is deliberately NOT attempted here, because TokensUsed carries no
-//     total-semantics guarantee: the pre-2026-09-03 claude provider set
-//     it to the OUTPUT count, and such rows are persisted and reloaded
+//     TokensUsed aggregate ⇒ the REPORTED direction is returned
+//     VERBATIM and the missing one is reported as 0 (= unknown).
+//     Deriving the missing direction is deliberately NOT attempted
+//     here, because TokensUsed carries no total-semantics guarantee:
+//     the pre-2026-09-03 claude provider set it to the OUTPUT count,
+//     and such rows are persisted and reloaded
 //     (internal/database/response_repository.go). Deriving from one
 //     would yield a wrong-but-plausible split — for a legacy row with
 //     input=7 and TokensUsed=34 (output) it would publish 7/27/34
-//     against a truth of 7/34/41. An explicit "total_tokens" key is
-//     only ever written by a provider that parsed a real usage object,
-//     so it IS a true total by construction; the bare aggregate is not.
+//     against a truth of 7/34/41, a fabricated 27. An explicit
+//     "total_tokens" key is only ever written by a provider that
+//     parsed a real usage object, so it IS a true total by
+//     construction; the bare aggregate is not.
+//     Erasing the reported direction to 0 is equally forbidden and was
+//     the defect this branch used to carry: for that same legacy row it
+//     published prompt=0 for a response whose prompt side WAS measured
+//     at 7, replacing a real number with a false "not reported" — the
+//     under-reporting class this accessor exists to end. Keeping the
+//     measurement is strictly more information than erasing it and
+//     strictly less invention than deriving from the aggregate.
+//   - Total, in that partial case, is the largest value that cannot
+//     contradict the parts: the explicit "total_tokens" when present and
+//     >= the known part, else the TokensUsed aggregate when >= the known
+//     part, else the known part itself. A malformed aggregate is
+//     discarded — a total smaller than a part it contains is impossible,
+//     so it is the untrustworthy aggregate that is dropped, never the
+//     measurement. The envelope may therefore under-add (7 + 0 != 41)
+//     because one direction is genuinely unknown; it can never
+//     self-contradict.
 //   - NEITHER reported ⇒ return (0, 0, TokensUsed). Zero means
 //     "provider did not report this direction" and is OpenAI-legal;
 //     it is the honest answer. NEVER a fabricated half.
@@ -179,29 +198,34 @@ func (r *LLMResponse) TokenSplit() (prompt, completion, total int) {
 		return prompt, completion, prompt + completion
 
 	case promptOK || completionOK:
-		// Partial report. Derive the missing direction ONLY from an
+		// Partial report. The reported direction is a REAL measurement
+		// and is returned verbatim — it is never erased. Only the MISSING
+		// direction is in question, and it is derived ONLY from an
 		// EXPLICIT total_tokens key, never from the bare TokensUsed
 		// aggregate — see the contract above for why the two are not
 		// interchangeable.
-		totalVal, totalOK := metadataFirstInt(r.Metadata, "total_tokens")
-		if !totalOK {
-			return 0, 0, total
-		}
-
 		known := promptVal + completionVal // exactly one is non-zero here
-		if totalVal < known {
-			// A total cannot be smaller than one of its parts, so this
-			// value is malformed and the relationship between these
-			// numbers is unknown. Report neither direction rather than
-			// publishing a figure we cannot justify (§11.4.6).
-			return 0, 0, totalVal
+
+		// Floor the total at the part we measured: a total smaller than
+		// one of its own parts is impossible, so a smaller aggregate is
+		// malformed and gets discarded — never the measurement (§11.4.6).
+		total = known
+		if r.TokensUsed >= known {
+			total = r.TokensUsed
 		}
 
-		// Derive the missing direction exactly: total − known.
-		if promptOK {
-			return promptVal, totalVal - promptVal, totalVal
+		if totalVal, totalOK := metadataFirstInt(r.Metadata, "total_tokens"); totalOK && totalVal >= known {
+			// An explicit, well-formed total is authoritative, and with
+			// two of three quantities known the third is determined.
+			if promptOK {
+				return promptVal, totalVal - promptVal, totalVal
+			}
+			return totalVal - completionVal, completionVal, totalVal
 		}
-		return totalVal - completionVal, completionVal, totalVal
+
+		// No usable explicit total: the missing direction stays unknown
+		// (0), which is OpenAI-legal and reads as "not reported".
+		return promptVal, completionVal, total
 
 	default:
 		// Provider reported only an aggregate. Report the directions as
