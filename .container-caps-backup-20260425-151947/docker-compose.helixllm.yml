@@ -167,7 +167,7 @@ services:
 
   # HelixLLM Kafka for messaging
   helixllm-kafka:
-    image: docker.io/bitnami/kafka:3.9.0
+    image: docker.io/soldevelo/kafka:3.9.0
     container_name: helixagent-helixllm-kafka
     ports:
       - "${HELIX_LLM_KAFKA_PORT:-9093}:9092"
