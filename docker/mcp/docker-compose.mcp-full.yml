@@ -420,18 +420,21 @@ services:
       - MCP_COMMAND=npx -y mcp-server-gcp
       - GOOGLE_APPLICATION_CREDENTIALS=/credentials.json
 
-  mcp-heroku:
-    <<: *common-config
-    mem_limit: 1g
-    memswap_limit: 1g
-    pids_limit: 1024
-    oom_score_adj: 500
-    container_name: helixagent-mcp-heroku
-    ports:
-      - "${HELIXAGENT_PORT_MCP_HEROKU:-8228}:9000"
-    environment:
-      - MCP_COMMAND=npx -y mcp-server-heroku
-      - HEROKU_API_KEY=${HEROKU_API_KEY}
+  # DISABLED 2026-09-10: heroku-mcp server leaks a node process per
+  # connection (socat fork-per-conn); each leaked server spins
+  # `npm exec heroku@latest repl` at 30-60% CPU continuously.
+  # mcp-heroku:
+  #   <<: *common-config
+  #   mem_limit: 1g
+  #   memswap_limit: 1g
+  #   pids_limit: 1024
+  #   oom_score_adj: 500
+  #   container_name: helixagent-mcp-heroku
+  #   ports:
+  #     - "${HELIXAGENT_PORT_MCP_HEROKU:-8228}:9000"
+  #   environment:
+  #     - MCP_COMMAND=npx -y mcp-server-heroku
+  #     - HEROKU_API_KEY=${HEROKU_API_KEY}
 
   mcp-cloudflare:
     <<: *common-config

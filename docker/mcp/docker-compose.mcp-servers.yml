@@ -476,32 +476,36 @@ services:
       retries: 3
       start_period: 15s
 
-  mcp-heroku:
-    build:
-      context: ../../MCP/submodules/heroku-mcp
-      dockerfile: ../../../docker/mcp/Dockerfile.mcp-submodule
-    container_name: helixagent-mcp-heroku
-    mem_limit: 1g
-    memswap_limit: 1g
-    pids_limit: 1024
-    oom_score_adj: 500
-    ports:
-      - "${HELIXAGENT_PORT_MCP_KUBERNETES:-8223}:9000"
-    environment:
-      - HEROKU_API_KEY=${HEROKU_API_KEY}
-    restart: unless-stopped
-    volumes:
-      - ./mcp_healthcheck.sh:/mcp_healthcheck.sh:ro
-    healthcheck:
-      # HXC-334: real MCP `initialize` round-trip. The previous
-      # ["CMD","nc","-z","localhost","9000"] reported healthy for servers that
-      # crash on every connection, because socat accepts the TCP connection
-      # regardless of whether the wrapped server works.
-      test: ["CMD", "sh", "/mcp_healthcheck.sh"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 15s
+  # DISABLED 2026-09-10: heroku-mcp server leaks a node process per
+  # connection (socat fork-per-conn) and each leaked server spins
+  # `npm exec heroku@latest repl` at 30-60% CPU continuously.
+  # Container was rm -f'd; do not re-enable until the leak is fixed.
+  # mcp-heroku:
+  #   build:
+  #     context: ../../MCP/submodules/heroku-mcp
+  #     dockerfile: ../../../docker/mcp/Dockerfile.mcp-submodule
+  #   container_name: helixagent-mcp-heroku
+  #   mem_limit: 1g
+  #   memswap_limit: 1g
+  #   pids_limit: 1024
+  #   oom_score_adj: 500
+  #   ports:
+  #     - "${HELIXAGENT_PORT_MCP_HEROKU:-8223}:9000"
+  #   environment:
+  #     - HEROKU_API_KEY=${HEROKU_API_KEY}
+  #   restart: unless-stopped
+  #   volumes:
+  #     - ./mcp_healthcheck.sh:/mcp_healthcheck.sh:ro
+  #   healthcheck:
+  #     # HXC-334: real MCP `initialize` round-trip. The previous
+  #     # ["CMD","nc","-z","localhost","9000"] reported healthy for servers that
+  #     # crash on every connection, because socat accepts the TCP connection
+  #     # regardless of whether the wrapped server works.
+  #     test: ["CMD", "sh", "/mcp_healthcheck.sh"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 3
+  #     start_period: 15s
 
   mcp-sentry:
     # Per-submodule Dockerfile (BUGFIXES Issue #54): turbo monorepo;

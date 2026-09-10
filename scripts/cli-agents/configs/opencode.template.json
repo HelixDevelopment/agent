@@ -172,11 +172,6 @@
       "command": ["npx", "-y", "mcp-server-netlify"],
       "environment": { "NETLIFY_AUTH_TOKEN": "${NETLIFY_AUTH_TOKEN}" }
     },
-    "heroku": {
-      "type": "local",
-      "command": ["npx", "-y", "@heroku/mcp-server"],
-      "environment": { "HEROKU_API_KEY": "${HEROKU_API_KEY}" }
-    },
     "aws-s3": {
       "type": "local",
       "command": ["npx", "-y", "aws-s3-mcp"],

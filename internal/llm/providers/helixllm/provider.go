@@ -249,6 +249,104 @@ func NewProviderFromEnv() *Provider {
 	})
 }
 
+// buildMessages translates internal messages onto the OpenAI wire shape,
+// shared by Complete and CompleteStream so the two paths cannot drift.
+//
+// HXC-349: this now also forwards the tool-loop fields. AssistantToolCalls is
+// the authoritative typed slice on models.Message (its legacy untyped
+// ToolCalls map is explicitly documented there as backward-compat only and is
+// NOT read here — reading it would emit unordered tool calls). ToolCallID is
+// forwarded verbatim so a role="tool" reply binds to the call it answers.
+func buildMessages(in []models.Message) []Message {
+	out := make([]Message, 0, len(in))
+	for _, msg := range in {
+		role := msg.Role
+		if role == "" {
+			role = "user"
+		}
+		m := Message{
+			Role:       role,
+			Content:    msg.Content,
+			ToolCallID: msg.ToolCallID,
+		}
+		for _, tc := range msg.AssistantToolCalls {
+			m.ToolCalls = append(m.ToolCalls, toolCallFromModel(tc))
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// toolCallFromModel maps an internal tool call onto the wire shape.
+func toolCallFromModel(tc models.ToolCall) ToolCall {
+	typ := tc.Type
+	if typ == "" {
+		typ = "function"
+	}
+	return ToolCall{
+		ID:   tc.ID,
+		Type: typ,
+		Function: ToolCallFunction{
+			Name:      tc.Function.Name,
+			Arguments: tc.Function.Arguments,
+		},
+	}
+}
+
+// toolCallsToModel maps wire tool calls back onto the internal shape so the
+// handler's existing map-back (openai_compatible.go convertSingleResponseToOpenAI)
+// has something to render. Defaults a missing type to "function": some
+// upstreams return bare {id, function} and an empty type is rejected by
+// OpenAI clients as malformed.
+func toolCallsToModel(in []ToolCall) []models.ToolCall {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]models.ToolCall, 0, len(in))
+	for _, tc := range in {
+		typ := tc.Type
+		if typ == "" {
+			typ = "function"
+		}
+		out = append(out, models.ToolCall{
+			ID:   tc.ID,
+			Type: typ,
+			Function: models.ToolCallFunction{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			},
+		})
+	}
+	return out
+}
+
+// buildTools translates internal tool declarations onto the OpenAI wire shape.
+// Returns nil for an empty input so `omitempty` elides the key entirely —
+// a no-tools request stays byte-identical to its pre-HXC-349 form.
+func buildTools(in []models.Tool) []Tool {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]Tool, 0, len(in))
+	for _, t := range in {
+		typ := t.Type
+		if typ == "" {
+			// OpenAI clients reject a tool with an empty type as malformed;
+			// "function" is the only type the schema currently defines.
+			typ = "function"
+		}
+		out = append(out, Tool{
+			Type: typ,
+			Function: ToolFunction{
+				Name:        t.Function.Name,
+				Description: t.Function.Description,
+				Parameters:  t.Function.Parameters,
+			},
+		})
+	}
+	return out
+}
+
 // Complete implements the LLMProvider interface
 func (p *Provider) Complete(ctx context.Context, req *models.LLMRequest) (*models.LLMResponse, error) {
 	if err := p.initialize(); err != nil {
@@ -260,17 +358,7 @@ func (p *Provider) Complete(ctx context.Context, req *models.LLMRequest) (*model
 		model = p.model
 	}
 
-	messages := make([]Message, 0, len(req.Messages))
-	for _, msg := range req.Messages {
-		role := msg.Role
-		if role == "" {
-			role = "user"
-		}
-		messages = append(messages, Message{
-			Role:    role,
-			Content: msg.Content,
-		})
-	}
+	messages := buildMessages(req.Messages)
 
 	chatReq := ChatCompletionRequest{
 		Model:       model,
@@ -279,6 +367,8 @@ func (p *Provider) Complete(ctx context.Context, req *models.LLMRequest) (*model
 		Temperature: req.ModelParams.Temperature,
 		MaxTokens:   req.ModelParams.MaxTokens,
 		TopP:        req.ModelParams.TopP,
+		Tools:       buildTools(req.Tools),
+		ToolChoice:  req.ToolChoice,
 	}
 
 	endpoint := p.endpoint + chatEndpoint
@@ -325,9 +415,16 @@ func (p *Provider) Complete(ctx context.Context, req *models.LLMRequest) (*model
 		return nil, fmt.Errorf("no response from model")
 	}
 
+	// HXC-349: surface the upstream tool call + finish_reason. Previously
+	// both were parsed off the wire into Choice/Message and then silently
+	// dropped here, so a model that asked to call a tool reached the handler
+	// as plain prose and the handler's map-back had nothing to map.
+	choice := chatResp.Choices[0]
 	return &models.LLMResponse{
-		Content:    chatResp.Choices[0].Message.Content,
-		TokensUsed: chatResp.Usage.TotalTokens,
+		Content:      choice.Message.Content,
+		TokensUsed:   chatResp.Usage.TotalTokens,
+		FinishReason: choice.FinishReason,
+		ToolCalls:    toolCallsToModel(choice.Message.ToolCalls),
 		Metadata: map[string]interface{}{
 			"model":             chatResp.Model,
 			"provider":          "helixllm",
@@ -348,17 +445,7 @@ func (p *Provider) CompleteStream(ctx context.Context, req *models.LLMRequest) (
 		model = p.model
 	}
 
-	messages := make([]Message, 0, len(req.Messages))
-	for _, msg := range req.Messages {
-		role := msg.Role
-		if role == "" {
-			role = "user"
-		}
-		messages = append(messages, Message{
-			Role:    role,
-			Content: msg.Content,
-		})
-	}
+	messages := buildMessages(req.Messages)
 
 	chatReq := ChatCompletionRequest{
 		Model:       model,
@@ -367,6 +454,8 @@ func (p *Provider) CompleteStream(ctx context.Context, req *models.LLMRequest) (
 		Temperature: req.ModelParams.Temperature,
 		MaxTokens:   req.ModelParams.MaxTokens,
 		TopP:        req.ModelParams.TopP,
+		Tools:       buildTools(req.Tools),
+		ToolChoice:  req.ToolChoice,
 	}
 
 	endpoint := p.endpoint + chatEndpoint
@@ -423,9 +512,22 @@ func (p *Provider) handleStream(resp *http.Response, resultChan chan<- *models.L
 		}
 
 		if len(streamResp.Choices) > 0 {
+			// HXC-349: carry tool calls + finish_reason on stream chunks too,
+			// read off the same Message field this loop already reads Content
+			// from. NOTE (§11.4.6, honest gap): this decoder consumes
+			// concatenated JSON objects and reads Choice.Message, not
+			// Choice.Delta — an upstream that emits true SSE `data:` frames
+			// with incremental Delta tool-call fragments is NOT reassembled
+			// here. That pre-existing limitation is unchanged by this fix; the
+			// handler deliberately routes stream+tools through the
+			// non-streaming path (streamToolCallViaNonStreaming) for exactly
+			// this reason.
+			choice := streamResp.Choices[0]
 			resultChan <- &models.LLMResponse{
-				Content:    streamResp.Choices[0].Message.Content,
-				TokensUsed: streamResp.Usage.TotalTokens,
+				Content:      choice.Message.Content,
+				TokensUsed:   streamResp.Usage.TotalTokens,
+				FinishReason: choice.FinishReason,
+				ToolCalls:    toolCallsToModel(choice.Message.ToolCalls),
 				Metadata: map[string]interface{}{
 					"model": streamResp.Model,
 				},
@@ -564,10 +666,37 @@ func (p *Provider) servedModels() []string {
 // live serving layer via servedModels. Capability flags carry only what this
 // provider's code evidences: SupportsStreaming is backed by the real
 // CompleteStream implementation. Flags with no serving-layer or code
-// evidence here (tools/function-calling — ChatCompletionRequest has no Tools
-// field; reasoning; code completion/analysis/refactoring; embeddings — the
-// endpoint constant has no calling method) are reported FALSE/absent rather
-// than asserted true.
+// evidence here (reasoning; code completion/analysis/refactoring; embeddings
+// — the endpoint constant has no calling method) are reported FALSE/absent
+// rather than asserted true.
+//
+// HXC-349 — why "tools" is STILL absent even though the plumbing now works.
+// The previous reason given here ("ChatCompletionRequest has no Tools field")
+// is now STALE: this provider DOES forward tools/tool_choice and DOES parse
+// tool_calls back. It is deliberately NOT advertised because the capability
+// is not end-to-end functional against the serving layer measured on
+// 2026-09-08:
+//
+//   - Tools genuinely REACH the model. Same message ± a tool schema, measured
+//     directly against the local OpenAI-compatible backend:
+//     prompt_tokens 40 -> 182 (one small tool) and 42 -> 3229 (12 tools).
+//     A real, large, repeatable delta — the schema is in the prompt.
+//   - The model REASONS about them correctly (it named the right function
+//     with the right arguments).
+//   - But the response NEVER carries a structured tool_calls array:
+//     tool_calls was null and finish_reason was "stop"/"length" — never
+//     "tool_calls" — across four attempts (fenced-JSON, fenced-XML, bare
+//     JSON, and tool_choice:"required"). The call comes back as prose.
+//
+// An OpenAI client (Claude Code, OpenCode, …) therefore still cannot execute
+// a tool against this backend. Advertising "tools" would convert an honest
+// gap into a false capability claim — the exact §11.4 bluff class this
+// provider's capability reporting exists to prevent. UNCONFIRMED (§11.4.6):
+// whether the missing extraction is llama.cpp's tool-call parser or the
+// model's non-conforming output format — the server does run with --jinja,
+// but the model emitted no <tool_call> markers in any probe, so the two
+// causes were not separable. Re-evaluate (and only then flip this flag) when
+// a serving model returns a real structured tool_calls array.
 func (p *Provider) GetCapabilities() *models.ProviderCapabilities {
 	return &models.ProviderCapabilities{
 		SupportedModels:       p.servedModels(),

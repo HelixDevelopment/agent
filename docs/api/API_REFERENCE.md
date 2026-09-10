@@ -125,6 +125,128 @@ data: [DONE]
 }
 ```
 
+##### HelixAgent request extensions
+
+These fields are HelixAgent additions to the OpenAI chat-completions request
+body. They are optional; omitting them preserves the documented default
+behaviour.
+
+| Field | Type | Default | Effect |
+|---|---|---|---|
+| `passthrough` | boolean | `false` | Opts the request OUT of the multi-round AI Debate and routes it verbatim to the provider chain. |
+| `force_provider` | string | `""` | Sends the request to the named provider, on both the streaming and non-streaming provider chain. Unknown or failing names fall back to the normal chain — never a hard failure. |
+| `ensemble_config` | object | `null` | Debate/ensemble tuning. See [Ensemble API](#ensemble-api). |
+
+###### `passthrough`
+
+```json
+{
+  "model": "helixagent-debate",
+  "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+  "passthrough": true
+}
+```
+
+**What it does.** With `passthrough: true`, your messages are forwarded to the
+provider chain **unmodified** and you get the provider's literal answer, instead
+of a debated synthesis from the ensemble. Use it when you want the model to obey
+a precise instruction rather than deliberate about it.
+
+**Default.** `false`. The three debate/ensemble model aliases
+(`helixagent-debate`, `helixagent-ensemble`, `helix-debate`, and their
+`helixagent/`-qualified forms) keep debating unless you explicitly opt out.
+`"passthrough": false` and a missing/`null` field are identical to the default.
+
+**Type.** Strictly boolean. A string `"true"` or a number `1` is rejected with
+HTTP 400 — the flag fails closed rather than guessing.
+
+**Interaction with `stream`.** Honoured identically for `stream: true` and
+`stream: false`. A streaming pass-through emits SSE chunks straight from the
+provider.
+
+**Interaction with `model`.** Only meaningful for the debate/ensemble aliases.
+`helixagent-llm` already routes to the provider chain, so the flag is a no-op
+there.
+
+**What the response looks like — the `model` field reports WHO ANSWERED.** A
+pass-through response reports **the provider and model that actually served the
+request**, not the alias you asked for, in the form `<provider>/<model>`:
+
+```json
+{
+  "model": "helixllm/qwen2.5-coder-7b",
+  "system_fingerprint": "fp_helixllm_v1",
+  "choices": [ ... ]
+}
+```
+
+The provider half is the provider the chain actually invoked (`helixllm`, or the
+cloud provider that answered, or the one you named in `force_provider`). The
+model half is the model id **that provider itself reported** for the response —
+not a name looked up in our configuration.
+
+This holds on **both** halves: the non-streaming response body and every SSE
+chunk of a streaming response carry the same value, including the
+tool-call-bearing streaming path.
+
+**Why it is not the model you requested.** The debate/ensemble aliases
+(`helixagent-debate`, `helixagent-ensemble`, `helix-debate`) name a *route*, not
+a model — no model is called `helixagent-debate`. Echoing the alias back told
+you nothing about which of several possible providers answered. Reporting the
+resolved identity instead is also what the OpenAI API itself does: request
+`gpt-4o` and the response comes back as `gpt-4o-2024-08-06`.
+
+> **Accepted cost — read this if you compare model strings.** A client that
+> asserts `response.model == request.model` **will now see a mismatch** on the
+> pass-through route, and on the other routes that reach the provider chain
+> (`helixagent-llm`, and the multi-turn / tools bypasses). This is intended, not
+> a defect: the mismatch is the information. If your client pins or validates
+> model names, compare against the model you requested — which you already have
+> — and treat the response `model` as a *report of what served you*, useful for
+> logging, cost attribution, and debugging which route answered.
+
+**When a provider reports no model id.** Some providers return a completion
+without naming a model. In that case the response reports the provider it
+genuinely came from and marks the unknown half explicitly:
+
+```json
+{ "model": "deepseek/<unreported>" }
+```
+
+The angle brackets are not valid in any provider's model identifier, so this can
+never be mistaken for a real model name. HelixAgent deliberately does **not**
+invent an id, and deliberately does **not** fall back to the alias you
+requested — a silent fallback would put a plausible-looking wrong answer in the
+field precisely in the cases nobody inspects.
+
+**When the flag does NOT apply.** Two request shapes are handled before it is
+consulted, in both streaming and non-streaming modes:
+
+- **Tool-result turns** (the last message is a `tool` result) are synthesised by
+  the tool-result handler. This breaks the
+  debate → `tool_calls` → results → debate loop, and takes precedence over
+  `passthrough`.
+- Requests that **already** bypass the debate by other means — multi-turn
+  conversations (more than one `user` message) and requests carrying a `tools`
+  array — are unaffected; the flag makes that pre-existing behaviour explicit
+  and requestable rather than incidental.
+
+**Behavioural differences from the debate route.** These are deliberate; they
+follow from "verbatim to the provider":
+
+- **Skills are not injected.** Skill matching rewrites the message set, which is
+  precisely what `passthrough` opts out of.
+- **`force_provider` is honoured** and takes precedence over the chain's normal
+  ordering.
+- **Errors.** When every provider in the chain fails you get
+  `503 no_provider_available`, the provider chain's long-standing error contract
+  (shared with the `helixagent-llm` route), rather than the ensemble's
+  categorised error.
+- **Timeouts.** The provider chain applies no per-provider deadline, so a hung
+  provider is bounded only by your own client timeout. This is a pre-existing
+  property of the chain shared by every route that uses it, not something
+  `passthrough` introduces; set a client-side timeout accordingly.
+
 #### GET /v1/models
 
 List available models.

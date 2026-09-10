@@ -566,27 +566,30 @@ services:
   # TIER 4: CLOUD PROVIDER MCP SERVERS - Ports 9701-9799
   # ===========================================================================
 
-  mcp-heroku:
-    build:
-      context: ../..
-      dockerfile: docker/mcp/Dockerfile.mcp-submodule
-      args:
-        SOURCE_DIR: MCP/submodules/heroku-mcp
-    container_name: helixagent-mcp-heroku
-    mem_limit: 1g
-    memswap_limit: 1g
-    pids_limit: 1024
-    oom_score_adj: 500
-    ports:
-      - "${HELIXAGENT_PORT_MCP_NOTION:-8250}:9000"
-    environment:
-      - HEROKU_API_KEY=${HEROKU_API_KEY}
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "nc", "-z", "localhost", "9000"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+  # DISABLED 2026-09-10: heroku-mcp server leaks a node process per
+  # connection (socat fork-per-conn); each leaked server spins
+  # `npm exec heroku@latest repl` at 30-60% CPU continuously.
+  # mcp-heroku:
+  #   build:
+  #     context: ../..
+  #     dockerfile: docker/mcp/Dockerfile.mcp-submodule
+  #     args:
+  #       SOURCE_DIR: MCP/submodules/heroku-mcp
+  #   container_name: helixagent-mcp-heroku
+  #   mem_limit: 1g
+  #   memswap_limit: 1g
+  #   pids_limit: 1024
+  #   oom_score_adj: 500
+  #   ports:
+  #     - "${HELIXAGENT_PORT_MCP_HEROKU:-8250}:9000"
+  #   environment:
+  #     - HEROKU_API_KEY=${HEROKU_API_KEY}
+  #   restart: unless-stopped
+  #   healthcheck:
+  #     test: ["CMD", "nc", "-z", "localhost", "9000"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 3
 
   mcp-cloudflare:
     build:

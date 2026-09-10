@@ -281,20 +281,23 @@ services:
       - SENTRY_AUTH_TOKEN=${SENTRY_AUTH_TOKEN:-}
       - SENTRY_ORG=${SENTRY_ORG:-}
 
-  mcp-heroku:
-    <<: *mcp-base
-    build:
-      context: ./submodules/heroku-mcp
-      dockerfile: ../../dockerfiles/Dockerfile.heroku
-    mem_limit: 1g
-    memswap_limit: 1g
-    pids_limit: 1024
-    oom_score_adj: 500
-    container_name: mcp-heroku
-    ports:
-      - "3032:3000"
-    environment:
-      - HEROKU_API_KEY=${HEROKU_API_KEY:-}
+  # DISABLED 2026-09-10: heroku-mcp server leaks a node process per
+  # connection (socat fork-per-conn); each leaked server spins
+  # `npm exec heroku@latest repl` at 30-60% CPU continuously.
+  # mcp-heroku:
+  #   <<: *mcp-base
+  #   build:
+  #     context: ./submodules/heroku-mcp
+  #     dockerfile: ../../dockerfiles/Dockerfile.heroku
+  #   mem_limit: 1g
+  #   memswap_limit: 1g
+  #   pids_limit: 1024
+  #   oom_score_adj: 500
+  #   container_name: mcp-heroku
+  #   ports:
+  #     - "3032:3000"
+  #   environment:
+  #     - HEROKU_API_KEY=${HEROKU_API_KEY:-}
 
   mcp-cloudflare:
     <<: *mcp-base

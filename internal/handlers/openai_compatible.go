@@ -306,6 +306,24 @@ type OpenAIChatRequest struct {
 	// HelixAgent extensions
 	EnsembleConfig *models.EnsembleConfig `json:"ensemble_config,omitempty"`
 	ForceProvider  string                 `json:"force_provider,omitempty"`
+	// Passthrough (HXC-350) opts this request OUT of the multi-round AI
+	// Debate and routes it verbatim to the provider chain, so the caller
+	// gets the literal answer to the literal instruction instead of a
+	// debated essay. Debate remains the DEFAULT for the debate/ensemble
+	// model aliases — only an explicit `"passthrough": true` bypasses it,
+	// on BOTH the streaming and the non-streaming path.
+	//
+	// Two verbatim paths already existed by ACCIDENT (multi-turn requests,
+	// and requests carrying a tools array). This flag makes the behaviour
+	// DELIBERATE and documented so callers depend on a contract rather
+	// than on a quirk of those two heuristics.
+	//
+	// The public contract — default, strict-boolean parsing, precedence
+	// behind the tool-result guard, and every deliberate difference from
+	// the debate route (skills, errors, timeouts) — is documented for
+	// callers in docs/api/API_REFERENCE.md, "HelixAgent request
+	// extensions".
+	Passthrough bool `json:"passthrough,omitempty"`
 }
 
 // OpenAIMessage represents a message in OpenAI chat format
@@ -651,6 +669,46 @@ func (h *UnifiedHandler) ChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// Explicit pass-through (HXC-350). The caller has opted this request out
+	// of the debate ensemble, so hand the full request to the provider chain
+	// unmodified. Routed to processWithProviderChain — the SAME destination
+	// the multi-turn bypass below uses — because that path reports the
+	// REQUESTED model and a real timestamp, whereas the tools bypass in
+	// processWithEnsemble still stamps the hardcoded "helixagent-ensemble"
+	// label. Placed after the tool-result guard above so that loop-breaking
+	// behaviour is unaffected (pinned by
+	// TestPassthrough_ToolResultTurnKeepsLoopBreaker).
+	//
+	// KNOWN, DELIBERATE differences from the debate/ensemble route — each
+	// audited in the HXC-350 review and pinned or documented, none silent:
+	//
+	//   force_provider — HONOURED (see processWithProviderChain).
+	//   skills         — NOT injected. processSkillsForRequest rewrites the
+	//                    message set, which is exactly what "verbatim" opts
+	//                    out of; injecting skills here would contradict the
+	//                    contract this flag exists to provide.
+	//   errors         — chain exhaustion reports 503 no_provider_available
+	//                    rather than sendCategorizedError. This is the chain
+	//                    route's long-standing contract, shared with the
+	//                    helixagent-llm route and the multi-turn bypass; it is
+	//                    an honest error either way.
+	//   timeouts       — the chain applies NO per-provider deadline, whereas
+	//                    the ensemble bounds each attempt by the registry's
+	//                    DefaultTimeout (the same value NewEnsembleService is
+	//                    constructed with) and the orchestrator bounds 20s. A
+	//                    hung provider therefore runs until the client
+	//                    disconnects. This gap is PRE-EXISTING and shared by
+	//                    all three chain callers — pass-through adds no new
+	//                    exposure — and closing it needs an accessor on
+	//                    services.ProviderRegistry for that already-defined
+	//                    budget, so it is tracked rather than fixed here (no
+	//                    invented timeout value, §11.4.6).
+	if req.Passthrough {
+		logrus.WithField("model", req.Model).Info("Explicit passthrough requested - bypassing AI Debate, routing verbatim to provider chain (HXC-350)")
+		h.processWithProviderChain(c, &req)
+		return
+	}
+
 	// Multi-turn detection (drainage iter-2 / Finding #19): the debate
 	// orchestrator's DebateConfig only carries a single Topic string —
 	// it does NOT carry the full conversation history. So when the
@@ -775,6 +833,27 @@ func (h *UnifiedHandler) handleStreamingChatCompletions(c *gin.Context, req *Ope
 	case "helixagent-llm", "helixagent/helixagent-llm",
 		"helix-llm", "helixagent/helix-llm":
 		logrus.Info("Streaming: helixagent-llm - using provider chain with fallback")
+		h.streamWithProviderChain(c, req)
+		return
+	}
+
+	// Explicit pass-through (HXC-350), streaming half. ChatCompletions
+	// dispatches here BEFORE its own pass-through check is reached, so
+	// without this branch the documented flag silently no-ops for exactly
+	// the mode real CLI-agent clients use (32 of the 49 challenge scripts
+	// that set `stream` set it to true) — a documented flag that does
+	// nothing is the §11.4.201(6) false-null class, not a cosmetic gap.
+	//
+	// ORDERING: the non-streaming handler returns from its tool-result
+	// guard BEFORE consulting req.Passthrough, so pass-through is by
+	// construction never applied to a tool-result turn there. The
+	// streaming tool-result guard lives much further down (after SSE
+	// headers and the first chunk are already committed), so the same
+	// ordering is expressed here as an explicit precondition rather than
+	// by position. Loop-breaking behaviour is therefore identical on both
+	// halves: a tool-result turn falls through to its own guard.
+	if req.Passthrough && !h.isToolResultProcessingTurn(req.Messages) {
+		logrus.WithField("model", req.Model).Info("Explicit passthrough requested - bypassing AI Debate, streaming verbatim from provider chain (HXC-350)")
 		h.streamWithProviderChain(c, req)
 		return
 	}
@@ -3126,6 +3205,89 @@ func (h *UnifiedHandler) convertChunkToSSE(chunk *models.LLMResponse, streamID, 
 	return "data: " + string(b) + "\n\n"
 }
 
+// chainUnreportedModel is the model half of the chain label when the
+// answering provider reports no model id of its own.
+//
+// It is deliberately shaped so it can never be mistaken for a model name: the
+// angle brackets are not legal in any provider's model identifier, so a client
+// that logs or displays it sees a placeholder rather than a plausible-looking
+// lie. The alternative — quietly substituting the requested alias — is exactly
+// the defect this label exists to fix, and it would do it precisely in the
+// cases nobody inspects. Fabricating an id is worse still (§11.4.6).
+const chainUnreportedModel = "<unreported>"
+
+// chainUnknownProvider is the provider half when even the provider's identity
+// is unavailable. In practice it is unreachable from the chain — every call
+// site knows which provider it just invoked — but the label must degrade
+// honestly rather than emit a bare "/<unreported>" if a future caller passes
+// nothing.
+const chainUnknownProvider = "<unknown-provider>"
+
+// chainResponseModelLabel returns the `model` value every provider-chain
+// response reports — non-streaming and streaming alike.
+//
+// I1, RESOLVED. OPERATOR DECISION (2026-09-09): the response reports THE
+// PROVIDER/MODEL THAT ACTUALLY ANSWERED, never the alias that was requested.
+// Chosen over echoing the request, over a fixed route name, and over omitting
+// the field, because:
+//
+//   - It matches what OpenAI itself does: ask for `gpt-4o`, get back
+//     `gpt-4o-2024-08-06`. Reporting the resolved identity rather than the
+//     request is the behaviour of the API this endpoint imitates.
+//   - It answers the standing complaint in tracker item HXC-350 (the
+//     meta-repo's docs/Issues.md; cited by ticket id rather than line number,
+//     which had already drifted twice): "All three routes report a single
+//     fixed model name regardless of which one was requested, so a caller
+//     cannot tell which route answered."
+//   - It satisfies this file's own rule that the model name IS the contract.
+//
+// ACCEPTED COST, documented rather than worked around: a client that
+// string-compares the response `model` against the model it requested now sees
+// a MISMATCH. That is expected and intended — it is the mismatch that carries
+// the information — and it is written up for callers in
+// docs/api/API_REFERENCE.md under `passthrough`.
+//
+// WHERE THE IDENTITY COMES FROM. The model half is the provider's OWN
+// self-report, read from LLMResponse.Metadata["model"] — the convention every
+// provider under internal/llm/providers already follows (helixllm sets it on
+// both its non-streaming and its streaming path; so do claude, gemini, qwen,
+// deepseek, zai, openrouter, githubmodels, ollama, venice, junie, zen). It is
+// deliberately preferred over any name the registry holds, because the point
+// of the decision is to report what ANSWERED, not what we asked for or what we
+// think we configured. The provider half is the name of the provider the chain
+// actually invoked, which is known at every call site.
+//
+// The single-funnel property is preserved: every label emitted by
+// processWithProviderChain, streamWithProviderChain and
+// streamToolCallViaNonStreaming is produced by this one function.
+func chainResponseModelLabel(providerName string, resp *models.LLMResponse) string {
+	model := ""
+	if resp != nil {
+		// A non-string or absent value is treated as "not reported" rather
+		// than coerced — a provider that puts something odd here must not be
+		// able to inject a garbage model name into the response envelope.
+		if raw, ok := resp.Metadata["model"]; ok {
+			if str, isStr := raw.(string); isStr {
+				model = strings.TrimSpace(str)
+			}
+		}
+	}
+	if model == "" {
+		model = chainUnreportedModel
+	}
+
+	provider := strings.TrimSpace(providerName)
+	if provider == "" && resp != nil {
+		// Second-best source, still the provider's own word for itself.
+		provider = strings.TrimSpace(resp.ProviderName)
+	}
+	if provider == "" {
+		provider = chainUnknownProvider
+	}
+
+	return provider + "/" + model
+}
+
 // processWithProviderChain handles helix-llm requests with provider chain and fallback
 // Tries: helixllm → best cloud provider → other cloud providers (ordered by score)
 func (h *UnifiedHandler) processWithProviderChain(c *gin.Context, req *OpenAIChatRequest) {
@@ -3136,13 +3298,49 @@ func (h *UnifiedHandler) processWithProviderChain(c *gin.Context, req *OpenAICha
 
 	internalReq := h.convertOpenAIChatRequest(req, c)
 
-	// Try helixllm first (local inference)
+	// force_provider (HXC-350 review, delta (a)). The ensemble route honours
+	// this field; this chain had ZERO references to it, so every caller that
+	// reached the chain — the helixagent-llm route, the multi-turn bypass and
+	// now explicit pass-through — had force_provider SILENTLY DROPPED. An
+	// accepted-then-ignored request field is the same false-null class as a
+	// documented flag that no-ops: the caller cannot tell it did nothing.
+	//
+	// A miss is NOT fatal: an unknown or failing name falls through to the
+	// normal chain rather than turning a typo into an outage.
+	if req.ForceProvider != "" {
+		if forced, forcedErr := h.providerRegistry.GetProvider(req.ForceProvider); forcedErr == nil {
+			response, provErr := forced.Complete(c.Request.Context(), internalReq)
+			if provErr == nil {
+				logrus.WithField("provider", req.ForceProvider).Info("[Provider Chain] force_provider succeeded")
+				openAIResp := h.convertSingleResponseToOpenAI(response, chainResponseModelLabel(req.ForceProvider, response))
+				c.JSON(http.StatusOK, openAIResp)
+				return
+			}
+			logrus.WithError(provErr).WithField("provider", req.ForceProvider).
+				Warn("[Provider Chain] force_provider failed — falling back to the normal chain")
+		} else {
+			logrus.WithField("provider", req.ForceProvider).
+				Warn("[Provider Chain] force_provider not registered — falling back to the normal chain")
+		}
+	}
+
+	// Try helixllm first (local inference).
+	//
+	// USE_HELIX_LLM=false is respected here STRUCTURALLY, not by an explicit
+	// check: ProviderRegistry stores the helixllm config with
+	// `Enabled: HelixLLMEnabledDefault()`, and every construction path that
+	// reads it goes through `case "helixllm": if cfg.Enabled`, which returns an
+	// error instead of a provider — so a disabled helixllm is never registered
+	// and GetProvider below simply misses. (processWithDirectProvider's
+	// explicit HelixLLMEnabledDefault() check is belt-and-braces, not a delta
+	// this route is missing.) Pinned by
+	// TestPassthrough_HelixLLMDisabled_ChainFallsThrough.
 	provider, err := h.providerRegistry.GetProvider(PrimaryProviderName)
 	if err == nil {
 		response, provErr := provider.Complete(c.Request.Context(), internalReq)
 		if provErr == nil {
 			logrus.Info("[Provider Chain] helixllm succeeded")
-			openAIResp := h.convertSingleResponseToOpenAI(response, req.Model)
+			openAIResp := h.convertSingleResponseToOpenAI(response, chainResponseModelLabel(PrimaryProviderName, response))
 			c.JSON(http.StatusOK, openAIResp)
 			return
 		}
@@ -3162,7 +3360,7 @@ func (h *UnifiedHandler) processWithProviderChain(c *gin.Context, req *OpenAICha
 		response, err := provider.Complete(c.Request.Context(), internalReq)
 		if err == nil {
 			logrus.WithField("provider", name).Info("[Provider Chain] Fallback provider succeeded")
-			openAIResp := h.convertSingleResponseToOpenAI(response, req.Model)
+			openAIResp := h.convertSingleResponseToOpenAI(response, chainResponseModelLabel(name, response))
 			c.JSON(http.StatusOK, openAIResp)
 			return
 		}
@@ -3199,13 +3397,38 @@ func (h *UnifiedHandler) streamWithProviderChain(c *gin.Context, req *OpenAIChat
 	internalReq := h.convertOpenAIChatRequest(req, c)
 	streamID := utils.SecureRandomID("chatcmpl") // D-20: crypto-random, collision-free; one ID per stream, reused across chunks
 
+	// force_provider — the streaming half of the same fix applied in
+	// processWithProviderChain. Honouring the field on only one of the two
+	// chains would re-create, at a second seam, exactly the asymmetry HXC-350
+	// closed: a request field that works for stream:false and silently
+	// no-ops for stream:true. A miss falls through to the normal chain.
+	if req.ForceProvider != "" {
+		if forced, forcedErr := h.providerRegistry.GetProvider(req.ForceProvider); forcedErr == nil {
+			streamChan, provErr := forced.CompleteStream(c.Request.Context(), internalReq)
+			if provErr == nil {
+				logrus.WithField("provider", req.ForceProvider).Info("[Provider Chain Stream] force_provider streaming")
+				if h.tryStreamWithContentCheck(c, streamChan, streamID, req.ForceProvider) {
+					return
+				}
+				logrus.WithField("provider", req.ForceProvider).
+					Warn("[Provider Chain Stream] force_provider produced no content — falling back to the normal chain")
+			} else {
+				logrus.WithError(provErr).WithField("provider", req.ForceProvider).
+					Warn("[Provider Chain Stream] force_provider failed — falling back to the normal chain")
+			}
+		} else {
+			logrus.WithField("provider", req.ForceProvider).
+				Warn("[Provider Chain Stream] force_provider not registered — falling back to the normal chain")
+		}
+	}
+
 	// Try helixllm first
 	provider, err := h.providerRegistry.GetProvider(PrimaryProviderName)
 	if err == nil {
 		streamChan, provErr := provider.CompleteStream(c.Request.Context(), internalReq)
 		if provErr == nil {
 			logrus.Info("[Provider Chain Stream] helixllm streaming")
-			if h.tryStreamWithContentCheck(c, streamChan, streamID, req.Model, PrimaryProviderName) {
+			if h.tryStreamWithContentCheck(c, streamChan, streamID, PrimaryProviderName) {
 				return
 			}
 			logrus.Warn("[Provider Chain Stream] helixllm produced no content — falling through")
@@ -3229,7 +3452,7 @@ func (h *UnifiedHandler) streamWithProviderChain(c *gin.Context, req *OpenAIChat
 			continue
 		}
 		logrus.WithField("provider", name).Info("[Provider Chain Stream] Fallback streaming")
-		if h.tryStreamWithContentCheck(c, streamChan, streamID, req.Model, name) {
+		if h.tryStreamWithContentCheck(c, streamChan, streamID, name) {
 			return
 		}
 		logrus.WithField("provider", name).Warn(
@@ -3254,6 +3477,10 @@ func (h *UnifiedHandler) streamToolCallViaNonStreaming(c *gin.Context, req *Open
 	// Try helixllm first, then fallback chain — same priority as
 	// non-streaming processWithProviderChain.
 	var resp *models.LLMResponse
+	// wonBy records WHICH provider produced resp. Needed because this path
+	// builds its own SSE envelopes rather than going through
+	// tryStreamWithContentCheck, so it must ask the shared labeller itself.
+	var wonBy string
 	tryProvider := func(name string) bool {
 		provider, err := h.providerRegistry.GetProvider(name)
 		if err != nil {
@@ -3272,6 +3499,7 @@ func (h *UnifiedHandler) streamToolCallViaNonStreaming(c *gin.Context, req *Open
 			return false
 		}
 		resp = r
+		wonBy = name
 		logrus.WithField("provider", name).
 			Info("[Provider Chain Stream/Tools] provider succeeded")
 		return true
@@ -3301,7 +3529,19 @@ func (h *UnifiedHandler) streamToolCallViaNonStreaming(c *gin.Context, req *Open
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
 
-	chunk := h.convertChunkToSSE(resp, streamID, req.Model)
+	// I1 (operator decision, 2026-09-09). This function is the THIRD label
+	// emission path and the one the "every label goes through one funnel"
+	// claim did not cover: it built both of its envelopes from req.Model
+	// directly. It is reachable under pass-through —
+	// handleStreamingChatCompletions routes `passthrough + stream:true` into
+	// streamWithProviderChain, which hands any tools-bearing request straight
+	// here — and tools-bearing streaming requests are exactly what CLI-agent
+	// clients send. Left on req.Model, the decision would have held for two of
+	// the three streaming shapes and silently no-opped for the third, which is
+	// the same false-null asymmetry HXC-350 closed at the flag seam.
+	respModelLabel := chainResponseModelLabel(wonBy, resp)
+
+	chunk := h.convertChunkToSSE(resp, streamID, respModelLabel)
 	c.Writer.Write([]byte(chunk))
 	c.Writer.Flush()
 
@@ -3325,7 +3565,7 @@ func (h *UnifiedHandler) streamToolCallViaNonStreaming(c *gin.Context, req *Open
 		ID:      streamID,
 		Object:  "chat.completion.chunk",
 		Created: time.Now().Unix(),
-		Model:   req.Model,
+		Model:   respModelLabel,
 		Choices: []sseChunkChoice{{Index: 0, FinishReason: finishReason}},
 	}
 	if b, err := json.Marshal(finalEnvelope); err == nil {
@@ -3357,7 +3597,7 @@ func (h *UnifiedHandler) streamToolCallViaNonStreaming(c *gin.Context, req *Open
 func (h *UnifiedHandler) tryStreamWithContentCheck(
 	c *gin.Context,
 	streamChan <-chan *models.LLMResponse,
-	streamID, model, providerName string,
+	streamID, providerName string,
 ) bool {
 	// Drain leading empty chunks until we find content OR the channel
 	// closes / timeout expires.
@@ -3365,6 +3605,15 @@ func (h *UnifiedHandler) tryStreamWithContentCheck(
 	if !ok {
 		return false
 	}
+
+	// The label is derived HERE rather than passed in, because the answering
+	// provider's own model id only becomes available once a chunk has actually
+	// arrived (§11.4.6 — before the peek there is nothing to report but a
+	// guess). The first content chunk is the right source: it is the one that
+	// proves this provider won the chain, and providers stamp the same
+	// Metadata["model"] on every chunk of a stream, so reusing it for the
+	// remaining chunks keeps a single stream internally consistent.
+	model := chainResponseModelLabel(providerName, firstContent)
 
 	// Real content exists — commit headers + replay first chunk + drain.
 	c.Header("Content-Type", "text/event-stream")
