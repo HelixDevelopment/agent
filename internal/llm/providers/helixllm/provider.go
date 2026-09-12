@@ -10,12 +10,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
+	agenthttp "dev.helix.agent/internal/http"
 	"dev.helix.agent/internal/llm"
 	"dev.helix.agent/internal/models"
 	"dev.helix.agent/internal/netaddr"
@@ -210,11 +212,7 @@ func NewProvider(cfg Config) *Provider {
 		cfg.Timeout = defaultTimeout
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: cfg.TLSSkipVerify || getEnvBool("HELIX_LLM_TLS_SKIP_VERIFY", false),
-		},
-	}
+	transport := newProviderTransport(cfg.TLSSkipVerify || getEnvBool("HELIX_LLM_TLS_SKIP_VERIFY", false))
 
 	useLlamaCpp := cfg.UseLlamaCpp
 	if v := os.Getenv("HELIX_LLM_USE_LLAMACPP"); v != "" {
@@ -238,6 +236,42 @@ func NewProvider(cfg Config) *Provider {
 // Endpoint returns the resolved HelixLLM base URL this provider will call.
 // Useful for logging the effective endpoint after env/default resolution.
 func (p *Provider) Endpoint() string { return p.endpoint }
+
+// newProviderTransport builds the HTTP transport this provider dials with.
+//
+// It is deliberately NOT a bare `&http.Transport{}`: Go's zero value applies no
+// dial timeout, no idle-connection cap and no keep-alive, so every request
+// opens a fresh connection to the model host. The connection-reuse settings
+// come from the shared internal/http pool contract
+// (agenthttp.DefaultPoolConfig), which makes this provider the first
+// PRODUCTION consumer of that pool — before this change the package was
+// imported only by tests, so its pooling existed in code but was never used by
+// the running system.
+//
+// Sourcing the numbers from one place is what keeps this provider and the pool
+// from drifting apart on how much reuse is expected. TLS verification state is
+// preserved exactly: InsecureSkipVerify is set only when configured.
+func newProviderTransport(skipVerify bool) *http.Transport {
+	pc := agenthttp.DefaultPoolConfig()
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   pc.DialTimeout,
+			KeepAlive: pc.KeepAliveInterval,
+		}).DialContext,
+		MaxIdleConns:          pc.MaxIdleConns,
+		MaxIdleConnsPerHost:   pc.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       pc.MaxConnsPerHost,
+		IdleConnTimeout:       pc.IdleConnTimeout,
+		TLSHandshakeTimeout:   pc.TLSHandshakeTimeout,
+		ExpectContinueTimeout: pc.ExpectContinueTimeout,
+		DisableKeepAlives:     pc.DisableKeepAlives,
+		DisableCompression:    pc.DisableCompression,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: skipVerify,
+		},
+	}
+}
 
 // NewProviderFromEnv creates a new HelixLLM provider from environment variables
 func NewProviderFromEnv() *Provider {
