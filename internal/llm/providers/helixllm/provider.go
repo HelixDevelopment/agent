@@ -163,6 +163,12 @@ type Provider struct {
 	useLlamaCpp   bool
 	httpClient    *http.Client
 
+	// retryClient wraps httpClient with bounded retry + exponential backoff
+	// (internal/llm/retry.go) for NON-STREAMING calls. Streaming deliberately
+	// does not use it: replaying a partially-consumed stream would duplicate
+	// tokens rather than recover a failed request.
+	retryClient *llm.RetryableHTTPClient
+
 	mu          sync.RWMutex
 	initialized bool
 	initErr     error
@@ -219,6 +225,11 @@ func NewProvider(cfg Config) *Provider {
 		useLlamaCpp = strings.EqualFold(v, "true") || v == "1"
 	}
 
+	httpClient := &http.Client{
+		Timeout:   cfg.Timeout,
+		Transport: transport,
+	}
+
 	return &Provider{
 		endpoint:      cfg.Endpoint,
 		apiKey:        cfg.APIKey,
@@ -226,10 +237,8 @@ func NewProvider(cfg Config) *Provider {
 		timeout:       cfg.Timeout,
 		tlsSkipVerify: cfg.TLSSkipVerify,
 		useLlamaCpp:   useLlamaCpp,
-		httpClient: &http.Client{
-			Timeout:   cfg.Timeout,
-			Transport: transport,
-		},
+		httpClient:    httpClient,
+		retryClient:   llm.NewRetryableHTTPClient(httpClient, llm.DefaultRetryConfig()),
 	}
 }
 
@@ -429,7 +438,11 @@ func (p *Provider) Complete(ctx context.Context, req *models.LLMRequest) (*model
 		httpReq.Header.Set("X-Helix-LLM-Use-LlamaCpp", "false")
 	}
 
-	resp, err := p.httpClient.Do(httpReq)
+	// Non-streaming: retry transient failures with bounded backoff. The body is
+	// built from bytes.NewReader, so the request carries GetBody and every
+	// attempt replays the body intact (verified by
+	// TestRetryableHTTPClientReplaysBodyOnRetry).
+	resp, err := p.retryClient.Do(ctx, httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("execute request: %w", err)
 	}
@@ -638,7 +651,8 @@ func (p *Provider) GetModels(ctx context.Context) ([]string, error) {
 		req.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
 
-	resp, err := p.httpClient.Do(req)
+	// Idempotent GET: a transient failure is safe to retry.
+	resp, err := p.retryClient.Do(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("list models: %w", err)
 	}
