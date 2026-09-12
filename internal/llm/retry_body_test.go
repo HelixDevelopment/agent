@@ -76,3 +76,26 @@ func TestRetryableHTTPClientReplaysBodyOnRetry(t *testing.T) {
 		}
 	}
 }
+
+// A body that cannot be rewound (GetBody nil — an io.Pipe, say) must be
+// REFUSED when retries are enabled, not retried blind: a blind retry would send
+// ContentLength=N with an empty body and report success.
+func TestRetryableHTTPClientRefusesNonReplayableBody(t *testing.T) {
+	cfg := llm.DefaultRetryConfig()
+	cfg.MaxRetries = 3
+	cfg.InitialDelay = time.Millisecond
+
+	client := llm.NewRetryableHTTPClient(nil, cfg)
+
+	req, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:1/never-dialed", strings.NewReader(`{"a":1}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.GetBody = nil // simulate a streamed/non-replayable body
+
+	if _, err := client.Do(context.Background(), req); err == nil {
+		t.Fatal("Do with a non-replayable body and retries enabled: want a refusal, got nil")
+	} else if !strings.Contains(err.Error(), "cannot be replayed") {
+		t.Fatalf("refusal error = %v, want it to name the non-replayable body", err)
+	}
+}

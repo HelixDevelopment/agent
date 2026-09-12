@@ -205,11 +205,38 @@ func NewRetryableHTTPClient(client *http.Client, config RetryConfig) *RetryableH
 	}
 }
 
-// Do executes an HTTP request with retry logic
+// Do executes an HTTP request with retry logic.
+//
+// # Replaying the body
+//
+// http.Request.Clone copies the body READER, not its contents. A retry that
+// merely cloned the request therefore sent ContentLength=N with an EMPTY body:
+// the server received a different, smaller request and the caller was told the
+// retry succeeded. Measured failure — a dropped connection produced
+//
+//	all 3 attempts failed: Post "...": http: ContentLength=57 with Body length 0
+//
+// so each attempt now rewinds the body from req.GetBody().
+//
+// When a body cannot be rewound (GetBody is nil, e.g. an io.Pipe) and retries
+// are enabled, Do REFUSES rather than sending an empty body on a retry: an
+// honest error beats a silent wrong request. Buffering an unbounded body
+// instead would trade a correctness bug for a memory one.
 func (c *RetryableHTTPClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
+	hasBody := req.Body != nil && req.Body != http.NoBody
+	if hasBody && c.config.MaxRetries > 0 && req.GetBody == nil {
+		return nil, fmt.Errorf("retry: refusing to retry a request whose body cannot be replayed (GetBody is nil)")
+	}
+
 	result, err := ExecuteWithRetry(ctx, c.config, func() (*http.Response, error) {
-		// Clone the request for each attempt (body needs to be re-readable)
 		clonedReq := req.Clone(ctx)
+		if hasBody {
+			body, getErr := req.GetBody()
+			if getErr != nil {
+				return nil, fmt.Errorf("retry: rewinding request body: %w", getErr)
+			}
+			clonedReq.Body = body
+		}
 		//nolint:gosec // G704: retry wrapper for LLM provider calls — URL is supplied by the provider adapter, not the end user; SSRF defence applies at the adapter construction layer
 		return c.client.Do(clonedReq)
 	})
