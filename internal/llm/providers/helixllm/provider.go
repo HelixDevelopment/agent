@@ -249,9 +249,11 @@ func (p *Provider) Endpoint() string { return p.endpoint }
 // newProviderTransport builds the HTTP transport this provider dials with.
 //
 // It is deliberately NOT a bare `&http.Transport{}`: Go's zero value applies no
-// dial timeout, no idle-connection cap and no keep-alive, so every request
-// opens a fresh connection to the model host. The connection-reuse settings
-// come from the shared internal/http pool contract
+// dial timeout and no idle-connection cap, so connections were never reused
+// under load and a dead network path had no dial deadline. (A zero-value
+// net.Dialer does enable keep-alives with a default period, so "no keep-alive"
+// would be an overstatement — the defect was the missing CAP, not keep-alive.)
+// The connection-reuse settings come from the shared internal/http pool contract
 // (agenthttp.DefaultPoolConfig), which makes this provider the first
 // PRODUCTION consumer of that pool — before this change the package was
 // imported only by tests, so its pooling existed in code but was never used by
@@ -268,11 +270,20 @@ func newProviderTransport(skipVerify bool) *http.Transport {
 			Timeout:   pc.DialTimeout,
 			KeepAlive: pc.KeepAliveInterval,
 		}).DialContext,
-		MaxIdleConns:          pc.MaxIdleConns,
-		MaxIdleConnsPerHost:   pc.MaxIdleConnsPerHost,
+		MaxIdleConns:        pc.MaxIdleConns,
+		MaxIdleConnsPerHost: pc.MaxIdleConnsPerHost,
+		// NOTE (review F6): this caps in-flight connections to 10 PER HOST,
+		// while GetCapabilities advertises MaxConcurrentRequests: 100. The two
+		// are consistent with the provider registry's default concurrency
+		// semaphore (10), so the effective ceiling is 10, not 100 — the
+		// advertisement is a static convention shared with other providers
+		// rather than a measured limit. Reconciling the numbers is a config
+		// decision (raise the cap or lower the advertisement), tracked in
+		// specs/006 progress.yml rather than changed silently here.
 		MaxConnsPerHost:       pc.MaxConnsPerHost,
 		IdleConnTimeout:       pc.IdleConnTimeout,
 		TLSHandshakeTimeout:   pc.TLSHandshakeTimeout,
+		ResponseHeaderTimeout: pc.ResponseHeaderTimeout,
 		ExpectContinueTimeout: pc.ExpectContinueTimeout,
 		DisableKeepAlives:     pc.DisableKeepAlives,
 		DisableCompression:    pc.DisableCompression,
@@ -439,9 +450,12 @@ func (p *Provider) Complete(ctx context.Context, req *models.LLMRequest) (*model
 	}
 
 	// Non-streaming: retry transient failures with bounded backoff. The body is
-	// built from bytes.NewReader, so the request carries GetBody and every
-	// attempt replays the body intact (verified by
-	// TestRetryableHTTPClientReplaysBodyOnRetry).
+	// built from bytes.NewReader, so the request carries GetBody and each
+	// attempt replays it intact. The guarding tests are
+	// TestRetryableHTTPClientRewindIsLoadBearing (a custom RoundTripper, so the
+	// wrapper's rewind is load-bearing and its removal FAILs) and the provider
+	// chaos tests; TestRetryableHTTPClientReplaysBodyOnRetry alone does NOT
+	// discriminate, because net/http's own transport rewinds on that path.
 	resp, err := p.retryClient.Do(ctx, httpReq)
 	if err != nil {
 		return nil, fmt.Errorf("execute request: %w", err)

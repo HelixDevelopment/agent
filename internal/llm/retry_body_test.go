@@ -99,3 +99,97 @@ func TestRetryableHTTPClientRefusesNonReplayableBody(t *testing.T) {
 		t.Fatalf("refusal error = %v, want it to name the non-replayable body", err)
 	}
 }
+
+// recordingTransport is a custom RoundTripper, which means net/http's OWN body
+// rewind (transport.rewindBody, used by the default Transport) never runs. That
+// makes the WRAPPER's GetBody rewind load-bearing: remove it and the second
+// attempt receives an empty body, which this test catches. The httptest-based
+// test above cannot catch that, because on its path the stdlib rewinds for us.
+type recordingTransport struct {
+	mu       sync.Mutex
+	bodies   []string
+	attempts int32
+}
+
+func (rt *recordingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	got, _ := io.ReadAll(r.Body)
+	rt.mu.Lock()
+	rt.bodies = append(rt.bodies, string(got))
+	rt.mu.Unlock()
+
+	status := http.StatusOK
+	statusText := "200 OK"
+	payload := `{"ok":true}`
+	if atomic.AddInt32(&rt.attempts, 1) == 1 {
+		status = http.StatusServiceUnavailable
+		statusText = "503 Service Unavailable"
+		payload = ""
+	}
+	return &http.Response{
+		StatusCode: status,
+		Status:     statusText,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(payload)),
+		Request:    r,
+	}, nil
+}
+
+func TestRetryableHTTPClientRewindIsLoadBearing(t *testing.T) {
+	const body = `{"model":"m","messages":[]}`
+
+	rt := &recordingTransport{}
+	cfg := llm.DefaultRetryConfig()
+	cfg.MaxRetries = 1
+	cfg.InitialDelay = time.Millisecond
+	cfg.MaxDelay = 2 * time.Millisecond
+	cfg.JitterFactor = 0
+
+	client := llm.NewRetryableHTTPClient(&http.Client{Transport: rt}, cfg)
+
+	req, err := http.NewRequest(http.MethodPost, "http://example.invalid/v1/chat/completions", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+
+	resp, err := client.Do(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // test
+
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if len(rt.bodies) < 2 {
+		t.Fatalf("transport saw %d attempt(s), want a retry after the 503", len(rt.bodies))
+	}
+	for i, got := range rt.bodies {
+		if got != body {
+			t.Errorf("attempt %d sent body %q, want the ORIGINAL body replayed (wrapper rewind is load-bearing)", i+1, got)
+		}
+	}
+}
+
+// F1 regression: with retries disabled, a non-replayable body must still make
+// its single attempt. An earlier revision guarded the refusal on MaxRetries>0
+// but called req.GetBody() unconditionally, panicking on a nil GetBody here.
+func TestRetryableHTTPClientZeroRetriesNonReplayableBodyDoesNotPanic(t *testing.T) {
+	cfg := llm.DefaultRetryConfig()
+	cfg.MaxRetries = 0
+
+	rt := &recordingTransport{}
+	client := llm.NewRetryableHTTPClient(&http.Client{Transport: rt}, cfg)
+
+	req, err := http.NewRequest(http.MethodPost, "http://example.invalid/v1/chat/completions", strings.NewReader(`{"a":1}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.GetBody = nil // simulate a non-replayable body
+
+	// Must not panic. The single attempt is made; the 503 is surfaced as an error.
+	if _, err := client.Do(context.Background(), req); err == nil {
+		t.Fatal("want the single attempt's 503 surfaced as an error, got nil")
+	}
+	if got := atomic.LoadInt32(&rt.attempts); got != 1 {
+		t.Fatalf("attempts = %d, want exactly 1 when retries are disabled", got)
+	}
+}

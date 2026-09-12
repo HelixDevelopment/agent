@@ -64,32 +64,59 @@ func TestCompleteStressSustainedLoad(t *testing.T) {
 		n, n, latencies[n/2], latencies[(n*95)/100], latencies[n-1])
 }
 
-// T052 — chaos: the server accepts then abruptly drops the connection. The
-// provider must fail CLEANLY (an error, no panic) after its bounded retries.
-func TestCompleteChaosConnectionDrop(t *testing.T) {
+// T052 — chaos. A NON-IDEMPOTENT POST whose connection is dropped must be
+// attempted EXACTLY ONCE: the server may already have processed it, so
+// replaying could duplicate a generation and its billing. The provider must
+// fail cleanly, never replay a POST on a transport error.
+func TestCompleteChaosConnectionDropDoesNotReplayPOST(t *testing.T) {
 	var attempts int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		atomic.AddInt32(&attempts, 1)
+	srv := httptest.NewServer(dropConnHandler(&attempts))
+	defer srv.Close()
+
+	p := fastProvider(t, srv.URL)
+	if _, err := p.Complete(context.Background(), chatRequest()); err == nil {
+		t.Fatal("Complete against a dropped connection: want error, got nil")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 1 {
+		t.Fatalf("dropped-POST attempts = %d, want exactly 1 (a POST must not be replayed)", got)
+	}
+}
+
+// The IDEMPOTENT path keeps its resilience: a dropped GET may be retried, but
+// only within the configured bound.
+func TestGetModelsChaosConnectionDropRetries(t *testing.T) {
+	var attempts int32
+	srv := httptest.NewServer(dropConnHandler(&attempts))
+	defer srv.Close()
+
+	p := fastProvider(t, srv.URL)
+	if _, err := p.GetModels(context.Background()); err == nil {
+		t.Fatal("GetModels against a dropped connection: want error, got nil")
+	}
+
+	got := atomic.LoadInt32(&attempts)
+	if got < 2 {
+		t.Fatalf("dropped-GET attempts = %d, want >= 2 (an idempotent GET should retry)", got)
+	}
+	if maxAttempts := int32(fastRetryConfig().MaxRetries + 1); got > maxAttempts {
+		t.Fatalf("dropped-GET attempts = %d, want <= MaxRetries+1 (%d): retries are unbounded", got, maxAttempts)
+	}
+}
+
+// dropConnHandler accepts a request and closes the connection without replying.
+func dropConnHandler(attempts *int32) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(attempts, 1)
 		hj, ok := w.(http.Hijacker)
 		if !ok {
-			t.Error("test server does not support hijacking")
+			http.Error(w, "no hijack", http.StatusInternalServerError)
 			return
 		}
 		conn, _, err := hj.Hijack()
 		if err != nil {
 			return
 		}
-		_ = conn.Close() // drop without a response
-	}))
-	defer srv.Close()
-
-	p := fastProvider(t, srv.URL)
-	_, err := p.Complete(context.Background(), chatRequest())
-	if err == nil {
-		t.Fatal("Complete against a dropped connection: want error, got nil")
-	}
-	if got := atomic.LoadInt32(&attempts); got < 2 {
-		t.Fatalf("dropped connection was not retried: %d attempt(s)", got)
+		_ = conn.Close()
 	}
 }
 

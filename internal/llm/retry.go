@@ -2,9 +2,11 @@ package llm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"time"
 )
@@ -59,20 +61,61 @@ func IsRetryableStatusCode(statusCode int) bool {
 	}
 }
 
-// IsRetryableError determines if an error warrants a retry
+// IsRetryableError determines if an error warrants a retry.
+//
+// Timeouts and cancellations are NOT retryable. The comparison must use
+// errors.Is: net/http returns these WRAPPED in *url.Error, so `err ==
+// context.DeadlineExceeded` never matches and a timeout would be retried with a
+// fresh full client timeout on every attempt (measured: a 60ms client timeout
+// with 2 retries took 183ms — on the 60s default that is a multi-minute stall
+// per request).
 func IsRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	// Context cancelled or deadline exceeded - don't retry
-	if err == context.Canceled || err == context.DeadlineExceeded {
+	// Context cancellation / deadline: the caller asked us to stop.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 
-	// Network errors are generally retryable
-	// This includes connection refused, timeout, DNS errors, etc.
+	// An explicitly non-retryable error (see nonRetryableError): used for
+	// non-idempotent requests whose transport failed, where a replay could
+	// duplicate a side effect the server may already have performed.
+	var nonRetryable *nonRetryableError
+	if errors.As(err, &nonRetryable) {
+		return false
+	}
+
+	// Timeouts are not retryable for the same reason as context deadlines: the
+	// retry would double the wall-clock budget rather than recover.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+
+	// Network errors are generally retryable (connection refused, DNS, reset).
 	return true
+}
+
+// nonRetryableError marks an error the retry policy must not act on. It is
+// returned for a non-idempotent request whose transport attempt failed, because
+// the request bytes may already have reached the server.
+type nonRetryableError struct{ err error }
+
+func (e *nonRetryableError) Error() string { return e.err.Error() }
+func (e *nonRetryableError) Unwrap() error { return e.err }
+
+// isIdempotentMethod reports whether replaying a request with this method is
+// safe when the transport failed after the request may have been sent.
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete,
+		http.MethodOptions, http.MethodTrace:
+		return true
+	default:
+		return false
+	}
 }
 
 // ExecuteWithRetry executes a function with retry logic and exponential backoff
@@ -224,21 +267,44 @@ func NewRetryableHTTPClient(client *http.Client, config RetryConfig) *RetryableH
 // instead would trade a correctness bug for a memory one.
 func (c *RetryableHTTPClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
 	hasBody := req.Body != nil && req.Body != http.NoBody
-	if hasBody && c.config.MaxRetries > 0 && req.GetBody == nil {
+	canReplay := req.GetBody != nil
+
+	// Fail closed only when a RETRY could actually happen. With MaxRetries == 0
+	// there is a single attempt that uses the original body, nothing needs
+	// replaying, and refusing would be wrong. (`canReplay` also guards the
+	// GetBody call below, so a non-replayable body can never be dereferenced.)
+	if hasBody && !canReplay && c.config.MaxRetries > 0 {
 		return nil, fmt.Errorf("retry: refusing to retry a request whose body cannot be replayed (GetBody is nil)")
 	}
 
+	// net/http closes the body it is handed; because each attempt receives a
+	// FRESH reader from GetBody, the caller's original body would otherwise
+	// never be closed.
+	if hasBody && req.Body != nil {
+		defer req.Body.Close() //nolint:errcheck // closing the caller's request body
+	}
+
+	idempotent := isIdempotentMethod(req.Method)
+
 	result, err := ExecuteWithRetry(ctx, c.config, func() (*http.Response, error) {
 		clonedReq := req.Clone(ctx)
-		if hasBody {
+		if hasBody && canReplay {
 			body, getErr := req.GetBody()
 			if getErr != nil {
 				return nil, fmt.Errorf("retry: rewinding request body: %w", getErr)
 			}
 			clonedReq.Body = body
 		}
+
 		//nolint:gosec // G704: retry wrapper for LLM provider calls — URL is supplied by the provider adapter, not the end user; SSRF defence applies at the adapter construction layer
-		return c.client.Do(clonedReq)
+		resp, doErr := c.client.Do(clonedReq)
+		if doErr != nil && !idempotent {
+			// A non-idempotent request whose transport failed may already have
+			// been processed. Replaying it could duplicate a generation and its
+			// billing; only a retryable STATUS (the server answered) is safe.
+			return nil, &nonRetryableError{err: doErr}
+		}
+		return resp, doErr
 	})
 
 	if err != nil {
