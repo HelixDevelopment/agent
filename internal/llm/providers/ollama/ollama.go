@@ -103,6 +103,16 @@ func NewOllamaProviderWithRetry(baseURL, model string, retryConfig RetryConfig) 
 		ModelsDevID:    "ollama",
 		APIKey:         "local",
 		ResponseParser: discovery.ParseOllamaModelsResponse,
+		// FallbackModels is a DEGRADATION PATH, not a model catalogue, and is
+		// recorded here as a PERMITTED exception to CONST-036 (operator
+		// decision 2026-09-13). CONST-036 forbids hardcoded model lists because
+		// they silently override the single source of truth; this list is used
+		// ONLY when live discovery fails (see discovery.NewDiscoverer and the
+		// "source=fallback" log line), so it cannot override a successful
+		// discovery — the discovered set always wins. A host whose Ollama is
+		// unreachable still needs SOME way to describe the provider, and an
+		// empty list would make the provider unusable rather than honest.
+		// TestOllamaFallbackOnlyOnDiscoveryFailure pins that ordering.
 		FallbackModels: []string{
 			"llama2",
 			"llama2:13b",
