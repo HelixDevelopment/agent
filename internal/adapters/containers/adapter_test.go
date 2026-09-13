@@ -95,6 +95,16 @@ func (m *mockRuntime) Exec(
 	return &runtime.ExecResult{ExitCode: 0}, nil
 }
 
+// Run is the one-shot `run --rm` form. The mock reports success without
+// performing anything, which is all these adapter tests need; the runtime
+// interface gained this method upstream and the mock was not updated, so the
+// whole package's tests failed to COMPILE (not merely fail) until it existed.
+func (m *mockRuntime) Run(
+	ctx context.Context, image string, cmd []string, opts ...runtime.RunOption,
+) (*runtime.ExecResult, error) {
+	return &runtime.ExecResult{ExitCode: 0}, nil
+}
+
 func (m *mockRuntime) Logs(
 	ctx context.Context, id string, opts ...runtime.LogOption,
 ) (io.ReadCloser, error) {
