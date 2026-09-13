@@ -362,10 +362,22 @@ func TestFilterAvailablePackages(t *testing.T) {
 
 		packages := FilterAvailablePackages(ExtendedMCPPackages)
 
-		// All packages without RequiresEnv should be included
+		// A returned package MAY still declare required env vars: the filter
+		// includes it precisely BECAUSE they are set (see
+		// FilterAvailablePackages: it returns a package when RequiresEnv is
+		// empty OR every var is set). The previous assertion demanded
+		// RequiresEnv be EMPTY, which is a different and wrong property — it
+		// failed as soon as any package with a satisfied key was available,
+		// which happens whenever the developer's shell exports one (measured:
+		// TAVILY_API_KEY is set on this host, so tavily is legitimately
+		// available and still declares it). Assert the intent the message
+		// already stated: every declared var is actually present.
 		for _, pkg := range packages {
-			assert.Empty(t, pkg.RequiresEnv,
-				"Package %s should have no env requirements or all required vars set", pkg.Name)
+			for _, envVar := range pkg.RequiresEnv {
+				assert.NotEmpty(t, os.Getenv(envVar),
+					"Package %s was returned as available but its required var %s is not set",
+					pkg.Name, envVar)
+			}
 		}
 	})
 
