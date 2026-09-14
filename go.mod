@@ -276,7 +276,7 @@ replace digital.vasic.vectordb => ../vector_db
 
 replace digital.vasic.toolschema => ../tool_schema
 
-replace digital.vasic.skillregistry => ../skill_registry
+replace dev.helix.agent/skillregistry => ../skill_registry
 
 replace digital.vasic.conversation => ../conversation
 
