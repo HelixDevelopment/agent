@@ -121,7 +121,7 @@ services:
 
   # --- Messaging ---
   kafka:
-    image: bitnami/kafka:latest
+    image: soldevelo/kafka:latest
     ports:
       - "9092:9092"
     environment:

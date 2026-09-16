@@ -72,7 +72,7 @@ services:
 
   # HelixLLM Kafka for messaging
   helixllm-kafka:
-    image: bitnami/kafka:latest
+    image: soldevelo/kafka:latest
     container_name: helixagent-helixllm-kafka
     mem_limit: 4g
     memswap_limit: 4g
