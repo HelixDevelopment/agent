@@ -69,6 +69,7 @@ type RouterContext struct {
 	intentBasedRouter       *services.IntentBasedRouter            // For re-initialization with StartupVerifier
 	taskWorker              *background.InMemoryWorker             // Drains /v1/tasks queue (closes #task-worker-pool-wiring)
 	ensembleSQLDB           *sql.DB                                // Optional Postgres pool for ensemble durability (closes #ensemble-db-wiring when reachable)
+	ToolRegistry            *services.ToolRegistry                 // HXC-159 T-P6.01/T-P6.03: unified tool registry (MCP+LSP+external sources); exposed for skill-tool-call enforcement wiring
 }
 
 // Shutdown stops all background services started by the router
@@ -344,6 +345,29 @@ func SetupRouterWithContext(cfg *config.Config) *RouterContext {
 
 	// Inject skills integration into unified handler
 	unifiedHandler.SetSkillsIntegration(skillsIntegration)
+
+	// HXC-159 T-P6.01: unified tool registry (attachment point rank 2 —
+	// services.ToolRegistry.RegisterExternalToolSource). Always constructed
+	// so T-P6.03's tool-call enforcement has a real registry to gate;
+	// wiring an actual external skills source is OPT-IN via
+	// HELIXSKILLS_EXTERNAL_SOURCE_DIR so every deployment that does not set
+	// it keeps today's behaviour byte-for-byte. D-4 (spec.md): this reads
+	// the configured directory as plain data (skills.NewExternalSkillSource
+	// walks it with this package's own Parser) — it never imports
+	// github.com/HelixDevelopment/skills as a Go module; see
+	// tests/compliance/module_graph_edge_test.go for the mechanical gate.
+	toolRegistry := services.NewToolRegistry(nil, nil)
+	rc.ToolRegistry = toolRegistry
+	if externalSkillsDir := os.Getenv("HELIXSKILLS_EXTERNAL_SOURCE_DIR"); externalSkillsDir != "" {
+		externalSource := skills.NewExternalSkillSource("helixskills-external", externalSkillsDir, skillService)
+		if regErr := externalSource.RegisterWith(toolRegistry); regErr != nil {
+			logger.WithError(regErr).WithField("dir", externalSkillsDir).
+				Warn("HELIXSKILLS_EXTERNAL_SOURCE_DIR set but external skill source registration failed")
+		} else {
+			logger.WithField("dir", externalSkillsDir).
+				Info("Registered external HelixSkills source into ToolRegistry (RS-10)")
+		}
+	}
 
 	// Initialize Cognee service with all features enabled
 	cogneeService := services.NewCogneeService(cfg, logger)

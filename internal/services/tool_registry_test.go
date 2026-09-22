@@ -447,6 +447,52 @@ func TestToolRegistry_RefreshTools(t *testing.T) {
 		_, mcpExistsAfter := freshRegistry.GetTool("mcp-tool-to-remove")
 		assert.False(t, mcpExistsAfter)
 	})
+
+	// HXC-159 T-P6.01.3: RefreshTools must NOT wipe a source registered via
+	// RegisterExternalToolSource. The existing tests above use
+	// newValidMockTool, whose Source() is always the literal "custom" —
+	// so they never actually exercised the wipe path for an
+	// externally-registered tool (a "custom" tool always survives
+	// RefreshTools's `tool.Source() != "custom"` clear). This test uses a
+	// tool whose Source() reports the REAL external-source name, exactly
+	// as attachment-point-rank-2 wiring (T-P6.01.2) does.
+	t.Run("refresh preserves tools registered via RegisterExternalToolSource", func(t *testing.T) {
+		freshRegistry := NewToolRegistry(nil, nil)
+
+		externalTool := &MockTool{
+			name:        "helixskills-example-skill",
+			description: "A skill sourced from an external tool source",
+			parameters: map[string]interface{}{
+				"query": map[string]interface{}{"type": "string"},
+			},
+			source: "helixskills-external", // NOT "custom" — the real shape
+		}
+		fetchCount := 0
+		fetcher := func() ([]Tool, error) {
+			fetchCount++
+			return []Tool{externalTool}, nil
+		}
+
+		require.NoError(t, freshRegistry.RegisterExternalToolSource("helixskills-external", fetcher))
+		_, existsBeforeRefresh := freshRegistry.GetTool("helixskills-example-skill")
+		require.True(t, existsBeforeRefresh, "sanity: the tool must be registered before refresh")
+		require.Equal(t, 1, fetchCount, "sanity: registration itself calls the fetcher exactly once")
+
+		require.NoError(t, freshRegistry.RefreshTools(context.Background()))
+
+		_, existsAfterRefresh := freshRegistry.GetTool("helixskills-example-skill")
+		assert.True(t, existsAfterRefresh,
+			"RegisterExternalToolSource's tool MUST survive RefreshTools — "+
+				"a refresh must not silently un-register an external source")
+		assert.GreaterOrEqual(t, fetchCount, 2,
+			"RefreshTools must re-invoke the registered fetcher, not merely leave stale entries behind")
+
+		// A second refresh must keep working (registration is durable, not
+		// a one-shot survivor of exactly one refresh).
+		require.NoError(t, freshRegistry.RefreshTools(context.Background()))
+		_, existsAfterSecondRefresh := freshRegistry.GetTool("helixskills-example-skill")
+		assert.True(t, existsAfterSecondRefresh, "external source must survive repeated refreshes")
+	})
 }
 
 func TestMCPToolWrapper(t *testing.T) {

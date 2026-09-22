@@ -33,15 +33,25 @@ type ToolRegistry struct {
 	mcpManager  *MCPManager
 	lspClient   *LSPClient
 	lastRefresh time.Time
+	// externalSources holds every fetcher registered via
+	// RegisterExternalToolSource, keyed by sourceName (HXC-159 T-P6.01.3).
+	// RefreshTools re-invokes each of these AFTER clearing non-custom
+	// tools, so an external source's tools are refreshed, not wiped —
+	// closing the gap where a source registered once (e.g. the HelixSkills
+	// external source, attachment-point rank 2) silently disappeared on
+	// the next refresh because its tools report a Source() other than
+	// "custom".
+	externalSources *safe.Store[string, func() ([]Tool, error)]
 }
 
 // NewToolRegistry creates a new tool registry
 func NewToolRegistry(mcpManager *MCPManager, lspClient *LSPClient) *ToolRegistry {
 	return &ToolRegistry{
-		tools:       safe.NewStore[string, Tool](),
-		customTools: safe.NewStore[string, Tool](),
-		mcpManager:  mcpManager,
-		lspClient:   lspClient,
+		tools:           safe.NewStore[string, Tool](),
+		customTools:     safe.NewStore[string, Tool](),
+		mcpManager:      mcpManager,
+		lspClient:       lspClient,
+		externalSources: safe.NewStore[string, func() ([]Tool, error)](),
 	}
 }
 
@@ -109,13 +119,33 @@ func (tr *ToolRegistry) validateParameterSchema(name string, schema interface{})
 	return nil
 }
 
-// RegisterExternalToolSource registers tools from an external source
+// RegisterExternalToolSource registers tools from an external source.
+//
+// The (sourceName, toolFetcher) pair is remembered in tr.externalSources
+// (HXC-159 T-P6.01.3) BEFORE the first fetch runs, so even a source whose
+// very first fetch fails is retried on every subsequent RefreshTools —
+// without this, RefreshTools's unconditional "clear every non-custom tool"
+// step (below) would silently orphan the source's tools the moment a
+// refresh ran, since a source's tools report their OWN Source() (e.g.
+// "helixskills-external"), never the literal "custom" that alone survives
+// a refresh.
 func (tr *ToolRegistry) RegisterExternalToolSource(sourceName string, toolFetcher func() ([]Tool, error)) error {
+	tr.externalSources.Put(sourceName, toolFetcher)
+
 	tools, err := toolFetcher()
 	if err != nil {
 		return fmt.Errorf("failed to fetch tools from %s: %w", sourceName, err)
 	}
+	tr.registerFetchedTools(sourceName, tools)
+	return nil
+}
 
+// registerFetchedTools validates and dedup-registers a batch of tools
+// fetched from sourceName into tr.tools. Shared by
+// RegisterExternalToolSource (first registration) and RefreshTools
+// (re-fetch on every subsequent refresh) so both paths get the same
+// validation, dedup, and logging "for free" — never a second policy path.
+func (tr *ToolRegistry) registerFetchedTools(sourceName string, tools []Tool) {
 	for _, tool := range tools {
 		name := tool.Name()
 		if err := tr.validateToolMetadata(tool); err != nil {
@@ -128,13 +158,16 @@ func (tr *ToolRegistry) RegisterExternalToolSource(sourceName string, toolFetche
 			log.Printf("Tool %s from %s already exists, skipping", name, sourceName)
 		}
 	}
-
-	return nil
 }
 
 // RefreshTools refreshes tools from all sources. Readers during refresh
 // may observe a transitional state (non-custom tools briefly absent);
 // callers retry on "tool not found" if that matters.
+//
+// HXC-159 T-P6.01.3: every source registered via RegisterExternalToolSource
+// is re-fetched AFTER the clear + MCP/LSP steps below, so a refresh
+// refreshes an external source's tools instead of wiping them — the
+// registered source itself is never un-registered by a refresh.
 func (tr *ToolRegistry) RefreshTools(ctx context.Context) error {
 	// Clear non-custom tools.
 	for name, tool := range tr.tools.Snapshot() {
@@ -162,6 +195,15 @@ func (tr *ToolRegistry) RefreshTools(ctx context.Context) error {
 		}
 		tr.tools.Put(wrapper.Name(), wrapper)
 		log.Printf("Added LSP tool: %s", wrapper.Name())
+	}
+
+	for sourceName, fetcher := range tr.externalSources.Snapshot() {
+		tools, fetchErr := fetcher()
+		if fetchErr != nil {
+			log.Printf("RefreshTools: external source %s fetch failed: %v — its tools stay absent until the next successful refresh", sourceName, fetchErr)
+			continue
+		}
+		tr.registerFetchedTools(sourceName, tools)
 	}
 
 	tr.lastRefresh = time.Now()
