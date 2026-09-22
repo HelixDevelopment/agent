@@ -262,9 +262,10 @@ func TestParser_ParseDirectory(t *testing.T) {
 
 	// Parse directory
 	parser := NewParser()
-	skills, err := parser.ParseDirectory(tempDir)
+	skills, failures, err := parser.ParseDirectory(tempDir)
 	require.NoError(t, err)
 	assert.Len(t, skills, 1)
+	assert.Len(t, failures, 0)
 
 	if len(skills) > 0 {
 		assert.Equal(t, "test-skill", skills[0].Name)

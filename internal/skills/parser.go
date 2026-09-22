@@ -333,9 +333,34 @@ func (p *Parser) extractTags(content string) []string {
 	return tags
 }
 
+// ParseFailure records one SKILL.md file that ParseDirectory encountered but
+// could not parse (HXC-159 T-P6.04). Path is the exact file that failed;
+// Error is the operator-visible reason (never swallowed).
+type ParseFailure struct {
+	Path  string
+	Error string
+}
+
 // ParseDirectory recursively parses all SKILL.md files in a directory.
-func (p *Parser) ParseDirectory(dir string) ([]*Skill, error) {
+//
+// T-P6.04 fail-loud-and-continue (documented choice, NOT fail-closed): a
+// malformed SKILL.md is surfaced in the returned []ParseFailure — logged at
+// Warn (raised from the previous Debug, which is why the defect this fixes
+// was invisible with a 1174-file production corpus: "optional skills that
+// fail to parse should not clutter logs" silently dropped every malformed
+// skill with zero operator signal) — but does NOT abort the whole walk.
+// Rationale: this parser backs a LIVE HTTP-facing skill registry
+// (Registry.Load / LoadFromPath); refusing every skill because one file is
+// malformed would take down a working registry over an isolated authoring
+// mistake, which is a worse operational failure mode for this consumer than
+// for a one-shot batch loader (contrast the upstream HelixSkills library's
+// LoadSource, which IS fail-closed per-source — a deliberate difference
+// recorded here, not an oversight: that loader seeds a fresh index from a
+// pinned corpus where an aborted load is safely retryable before anything
+// depends on it; this one refreshes a registry callers are already using).
+func (p *Parser) ParseDirectory(dir string) ([]*Skill, []ParseFailure, error) {
 	skills := make([]*Skill, 0)
+	var failures []ParseFailure
 
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -343,10 +368,14 @@ func (p *Parser) ParseDirectory(dir string) ([]*Skill, error) {
 		}
 
 		if !info.IsDir() && strings.ToUpper(info.Name()) == "SKILL.MD" {
-			skill, err := p.ParseFile(path)
-			if err != nil {
-				// Log at Debug — optional skills that fail to parse should not clutter logs
-				logrus.WithError(err).WithField("path", path).Debug("Skipping skill file that failed to parse")
+			skill, parseErr := p.ParseFile(path)
+			if parseErr != nil {
+				// Raised from Debug to Warn (T-P6.04.2): a malformed skill
+				// MUST be operator-visible, never a silent Debug-only entry
+				// a live deployment never reads.
+				logrus.WithError(parseErr).WithField("path", path).
+					Warn("Skill file failed to parse — surfaced in load report, not silently skipped")
+				failures = append(failures, ParseFailure{Path: path, Error: parseErr.Error()})
 				return nil
 			}
 			skills = append(skills, skill)
@@ -356,10 +385,10 @@ func (p *Parser) ParseDirectory(dir string) ([]*Skill, error) {
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("failed to walk directory: %w", err)
+		return nil, nil, fmt.Errorf("failed to walk directory: %w", err)
 	}
 
-	return skills, nil
+	return skills, failures, nil
 }
 
 // contains checks if a slice contains a string.

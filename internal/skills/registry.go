@@ -33,7 +33,11 @@ type Registry struct {
 	parser     *Parser
 	config     *SkillConfig
 	stats      atomic.Pointer[RegistryStats]
-	watcher    *DirectoryWatcher
+	// lastLoadFailures is the T-P6.04 load-report: every malformed skill
+	// file the most recent Load/LoadFromPath surfaced. Protected by
+	// writeMu (written only from those two callers, which already hold it).
+	lastLoadFailures atomic.Pointer[[]ParseFailure]
+	watcher          *DirectoryWatcher
 	log        *logrus.Logger
 }
 
@@ -76,10 +80,11 @@ func (r *Registry) Load(ctx context.Context) error {
 
 	r.log.WithField("directory", r.config.SkillsDirectory).Info("Loading skills")
 
-	skills, err := r.parser.ParseDirectory(r.config.SkillsDirectory)
+	skills, failures, err := r.parser.ParseDirectory(r.config.SkillsDirectory)
 	if err != nil {
 		return fmt.Errorf("failed to parse skills directory: %w", err)
 	}
+	r.recordLoadFailuresLocked(failures)
 
 	// Clear existing data
 	r.skills.Clear()
@@ -98,7 +103,12 @@ func (r *Registry) Load(ctx context.Context) error {
 		"total":      r.skills.Len(),
 		"categories": r.byCategory.Len(),
 		"triggers":   r.byTrigger.Len(),
+		"failed":     len(failures),
 	}).Info("Skills loaded successfully")
+	if len(failures) > 0 {
+		r.log.WithField("failed_count", len(failures)).
+			Warn("Some skill files failed to parse during load — see LoadFailures() for the per-file report")
+	}
 
 	return nil
 }
@@ -108,10 +118,11 @@ func (r *Registry) LoadFromPath(ctx context.Context, path string) error {
 	r.writeMu.Lock()
 	defer r.writeMu.Unlock()
 
-	skills, err := r.parser.ParseDirectory(path)
+	skills, failures, err := r.parser.ParseDirectory(path)
 	if err != nil {
 		return fmt.Errorf("failed to parse skills from path %s: %w", path, err)
 	}
+	r.recordLoadFailuresLocked(failures)
 
 	for _, skill := range skills {
 		r.registerSkillLocked(skill)
@@ -262,11 +273,34 @@ func (r *Registry) Stats() *RegistryStats {
 		TotalTriggers:    current.TotalTriggers,
 		LoadedAt:         current.LoadedAt,
 		LastUpdated:      current.LastUpdated,
+		FailedSkills:     current.FailedSkills,
 	}
 	for k, v := range current.SkillsByCategory {
 		stats.SkillsByCategory[k] = v
 	}
 	return stats
+}
+
+// LoadFailures returns the per-file parse-failure report from the most
+// recent Load/LoadFromPath (HXC-159 T-P6.04). Empty (never nil) when no
+// failures occurred or no load has run yet — callers distinguish
+// "zero failures" from "not yet loaded" via Stats().LoadedAt.IsZero().
+func (r *Registry) LoadFailures() []ParseFailure {
+	p := r.lastLoadFailures.Load()
+	if p == nil {
+		return []ParseFailure{}
+	}
+	out := make([]ParseFailure, len(*p))
+	copy(out, *p)
+	return out
+}
+
+// recordLoadFailuresLocked stores the parse-failure report for the load
+// currently in progress. Caller must hold writeMu (both call sites do).
+func (r *Registry) recordLoadFailuresLocked(failures []ParseFailure) {
+	stored := make([]ParseFailure, len(failures))
+	copy(stored, failures)
+	r.lastLoadFailures.Store(&stored)
 }
 
 // updateStatsLocked recalculates registry statistics. Caller must hold writeMu.
@@ -279,12 +313,17 @@ func (r *Registry) updateStatsLocked() {
 	if loadedAt.IsZero() {
 		loadedAt = time.Now()
 	}
+	failedCount := 0
+	if fp := r.lastLoadFailures.Load(); fp != nil {
+		failedCount = len(*fp)
+	}
 	next := &RegistryStats{
 		TotalSkills:      r.skills.Len(),
 		TotalTriggers:    r.byTrigger.Len(),
 		LoadedAt:         loadedAt,
 		LastUpdated:      time.Now(),
 		SkillsByCategory: make(map[string]int, r.byCategory.Len()),
+		FailedSkills:     failedCount,
 	}
 	r.byCategory.Range(func(cat string, skills []*Skill) bool {
 		next.SkillsByCategory[cat] = len(skills)

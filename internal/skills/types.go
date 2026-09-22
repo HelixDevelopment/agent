@@ -115,6 +115,12 @@ type RegistryStats struct {
 	TotalTriggers    int            `json:"total_triggers"`
 	LoadedAt         time.Time      `json:"loaded_at"`
 	LastUpdated      time.Time      `json:"last_updated"`
+	// FailedSkills is the count of SKILL.md files the most recent
+	// Load/LoadFromPath could not parse (HXC-159 T-P6.04). Non-zero here
+	// is the operator-visible load-report signal a malformed skill was
+	// surfaced, never silently skipped. See Registry.LoadFailures() for
+	// the per-file detail (path + reason).
+	FailedSkills int `json:"failed_skills"`
 }
 
 // SkillConfig configures the skill system.
