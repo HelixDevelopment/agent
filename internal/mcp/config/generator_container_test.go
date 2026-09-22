@@ -97,6 +97,12 @@ var containerPortBands = map[string][][2]int{
 	"design":        {{8281, 8282}},
 	"cloud":         {{8287, 8288}},
 	"ai":            {{8289, 8290}},
+	// HXC-159 T-P6.02: HelixSkills's containerized MCP entry. New category
+	// (the entry is a skill-graph/knowledge service, not "ai" or any
+	// existing band), so per this map's own §11.4.120 reconciliation
+	// discipline it gets a declared band here rather than reusing an
+	// unrelated one or falling through unbounded.
+	"knowledge": {{8291, 8292}},
 }
 
 func TestContainerMCPConfigGenerator_PortRanges(t *testing.T) {

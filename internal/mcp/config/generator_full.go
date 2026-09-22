@@ -809,6 +809,44 @@ func (g *FullMCPConfigGenerator) GenerateAllMCPs() map[string]MCPServerConfigFul
 		Enabled: g.hasEnvVar("GOOGLE_CLOUD_PROJECT"),
 	}
 
+	// HXC-159 T-P6.02: HelixSkills MCP server. github.com/HelixDevelopment/
+	// skills ships its own MCP server (13 tools, package
+	// github.com/HelixDevelopment/skills/cmd/server) run via
+	// `go run ./cmd/server --mcp stdio` — that binary's own documented
+	// invocation contract (cmd/server/main.go's package doc comment),
+	// never a Go import of the module (D-4 / T-P6.05's module-graph gate
+	// enforces that mechanically). `go run ./cmd/server` is a RELATIVE
+	// package path, which Go only resolves from WITHIN that module's own
+	// directory tree — this MCPServerConfigFull shape has no separate
+	// working-directory field (every other entry here is a globally
+	// resolvable `npx` package, which needs none), so the `cd <dir> &&`
+	// wrapper is the portable way to express "run this in that directory"
+	// inside a plain argv Command array; confirmed necessary by measured
+	// failure (`go run <abs-path>/cmd/server` from HelixAgent's own module
+	// directory: "directory ... outside main module or its selected
+	// dependencies") before landing this exact form.
+	// HELIXSKILLS_MODULE_PATH is the config-injected checkout root
+	// (CONST-051(C) dependency layout, e.g.
+	// "<consuming-project-root>/submodules/skills"); disabled — present
+	// but inert — until an operator sets it, so every existing deployment
+	// keeps today's behaviour untouched.
+	helixSkillsModulePath := g.getEnvOrDefault("HELIXSKILLS_MODULE_PATH", "")
+	mcps["helixskills"] = MCPServerConfigFull{
+		Type: "local",
+		Command: []string{
+			"sh", "-c",
+			"cd " + shellSingleQuote(helixSkillsModulePath) + " && exec go run ./cmd/server --mcp stdio",
+		},
+		Environment: g.expandEnvMap(map[string]string{ // #nosec G101 -- env-var references, not credentials
+			"HELIX_DB_HOST":     "{env:HELIXSKILLS_DB_HOST}",
+			"HELIX_DB_PORT":     "{env:HELIXSKILLS_DB_PORT}",
+			"HELIX_DB_NAME":     "{env:HELIXSKILLS_DB_NAME}",
+			"HELIX_DB_USER":     "{env:HELIXSKILLS_DB_USER}",
+			"HELIX_DB_PASSWORD": "{env:HELIXSKILLS_DB_PASSWORD}",
+		}),
+		Enabled: g.hasEnvVar("HELIXSKILLS_MODULE_PATH"),
+	}
+
 	return mcps
 }
 
@@ -832,4 +870,12 @@ func (g *FullMCPConfigGenerator) getEnvOrDefault(name, defaultVal string) string
 		return val
 	}
 	return defaultVal
+}
+
+// shellSingleQuote wraps s in POSIX single quotes, escaping any embedded
+// single quote so the result is safe to splice into a `sh -c "..."`
+// command string (used by the helixskills entry's `cd <dir> && ...`
+// wrapper — see its doc comment for why a shell wrapper is required here).
+func shellSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

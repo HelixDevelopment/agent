@@ -147,6 +147,12 @@ var MCPContainerPorts = []MCPContainerPort{
 	{"circleci", 8285, "devops"},   // devops growth block 8285-8286
 	{"gcs", 8287, "cloud"},         // cloud block 8287-8288
 	{"replicate", 8289, "ai"},      // ai block 8289-8290
+
+	// TIER 14: HelixSkills (8291) — HXC-159 T-P6.02. Containerized
+	// equivalent of the "local" go-run entry generator_full.go's
+	// GenerateAllMCPs adds; TestCompareWithNPXGenerator requires every
+	// name present there to also exist here.
+	{"helixskills", 8291, "knowledge"},
 }
 
 // ContainerMCPConfigGenerator generates containerized MCP configurations
@@ -707,6 +713,21 @@ func (g *ContainerMCPConfigGenerator) GenerateContainerMCPs() map[string]Contain
 		Type:     "remote",
 		Enabled:  g.hasEnvVar("REPLICATE_API_TOKEN"),
 		Category: "ai",
+	}
+
+	// HXC-159 T-P6.02: containerized HelixSkills MCP server. The "local"
+	// generator (generator_full.go) shells out to `go run ./cmd/server
+	// --mcp stdio` directly; the containerized equivalent instead reaches
+	// it as a remote SSE endpoint on a container this project's Containers
+	// Submodule (§11.4.76) is responsible for booting — this generator
+	// never spawns processes itself, matching every other entry here.
+	// Gated on the same HELIXSKILLS_MODULE_PATH opt-in as the local
+	// generator so the two stay behaviourally aligned (both inert until an
+	// operator opts in).
+	mcps["helixskills"] = ContainerMCPServerConfig{
+		Type:     "remote",
+		Enabled:  g.hasEnvVar("HELIXSKILLS_MODULE_PATH"),
+		Category: "knowledge",
 	}
 
 	g.resolveContainerEndpoints(mcps)
