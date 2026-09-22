@@ -358,6 +358,18 @@ func SetupRouterWithContext(cfg *config.Config) *RouterContext {
 	// tests/compliance/module_graph_edge_test.go for the mechanical gate.
 	toolRegistry := services.NewToolRegistry(nil, nil)
 	rc.ToolRegistry = toolRegistry
+
+	// HXC-159 T-P6.03 (RS-14): every tool call routed through
+	// ExecuteToolAs (never the unrestricted ExecuteTool) is gated by each
+	// skill's declared AllowedTools front-matter — previously parsed by
+	// ParseAllowedTools and enforced NOWHERE (a Critical-severity gap,
+	// spec.md D6 / `03` §7.6). skills.SkillAuthorizer maps that declaration
+	// onto this authorization decision; see tests/integration/
+	// skill_authorizer_integration_test.go for the anti-bluff proof this
+	// wiring is load-bearing (a version of this exact scenario with
+	// SetAuthorizer never called shows the over-reaching call succeeding).
+	toolRegistry.SetAuthorizer(skills.NewSkillAuthorizer(skillService))
+
 	if externalSkillsDir := os.Getenv("HELIXSKILLS_EXTERNAL_SOURCE_DIR"); externalSkillsDir != "" {
 		externalSource := skills.NewExternalSkillSource("helixskills-external", externalSkillsDir, skillService)
 		if regErr := externalSource.RegisterWith(toolRegistry); regErr != nil {

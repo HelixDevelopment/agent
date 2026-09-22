@@ -563,3 +563,93 @@ func BenchmarkToolRegistry_ExecuteTool(b *testing.B) {
 		_, _ = registry.ExecuteTool(ctx, "bench-exec-tool", params)
 	}
 }
+
+// HXC-159 T-P6.03 — Make AllowedTools enforcing.
+
+// TestToolRegistry_ExecuteTool_HasNoActorScopedEnforcement is the T-P6.03.1
+// RED baseline, kept as a standing regression guard: ExecuteTool (the
+// pre-existing, non-actor-scoped call boundary) has NO concept of "which
+// actor is calling" and therefore cannot enforce any per-actor policy —
+// an "over-reaching" call always succeeds there, regardless of what any
+// skill declares. This is not a bug in ExecuteTool (callers with no actor
+// concept are legitimately unrestricted); it is the reason ExecuteToolAs
+// exists as a SEPARATE, additive boundary — this test pins that ExecuteTool
+// itself never grows implicit enforcement that would silently change its
+// contract for those callers.
+func TestToolRegistry_ExecuteTool_HasNoActorScopedEnforcement(t *testing.T) {
+	registry := NewToolRegistry(nil, nil)
+	// Even with an authorizer installed that would refuse EVERYTHING,
+	// plain ExecuteTool must not consult it.
+	registry.SetAuthorizer(alwaysRefuseAuthorizer{})
+	require.NoError(t, registry.RegisterCustomTool(newValidMockTool("unrestricted-tool")))
+
+	result, err := registry.ExecuteTool(context.Background(), "unrestricted-tool", map[string]interface{}{"input": "x"})
+	require.NoError(t, err, "ExecuteTool must remain unrestricted even with an authorizer installed")
+	assert.NotNil(t, result)
+}
+
+// alwaysRefuseAuthorizer implements ToolCallAuthorizer, always refusing —
+// used to prove ExecuteTool ignores it and ExecuteToolAs enforces it.
+type alwaysRefuseAuthorizer struct{}
+
+func (alwaysRefuseAuthorizer) Authorize(actorID, toolName string) (bool, string) {
+	return false, "always-refuse test authorizer"
+}
+
+func TestToolRegistry_ExecuteToolAs_EnforcesAuthorizer(t *testing.T) {
+	registry := NewToolRegistry(nil, nil)
+	require.NoError(t, registry.RegisterCustomTool(newValidMockTool("Read")))
+	require.NoError(t, registry.RegisterCustomTool(newValidMockTool("Write")))
+
+	t.Run("allowed tool call succeeds", func(t *testing.T) {
+		registry.SetAuthorizer(scriptedAuthorizer{allow: map[string]bool{"reader-skill:Read": true}})
+		result, err := registry.ExecuteToolAs(context.Background(), "reader-skill", "Read", map[string]interface{}{"input": "x"})
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+	})
+
+	t.Run("RS-14: an over-reaching skill is refused, not executed", func(t *testing.T) {
+		// reader-skill is allowed Read but NOT Write.
+		auth := scriptedAuthorizer{allow: map[string]bool{"reader-skill:Read": true}}
+		registry.SetAuthorizer(auth)
+
+		result, err := registry.ExecuteToolAs(context.Background(), "reader-skill", "Write", map[string]interface{}{"input": "x"})
+		require.Error(t, err, "a skill declaring only Read must be refused when it attempts Write")
+		assert.Nil(t, result)
+		assert.ErrorIs(t, err, ErrToolCallRefused)
+	})
+
+	t.Run("T-P6.03.4 paired mutation: no authorizer installed means the over-reaching call SUCCEEDS", func(t *testing.T) {
+		// This is the "strip the enforcement check" mutation, expressed as
+		// the observable state a stripped wiring produces: with NO
+		// authorizer installed (SetAuthorizer never called, or called with
+		// nil — exactly what "stripping" the enforcement wiring in
+		// router.go would leave), the same over-reaching call that the
+		// subtest above proves is refused now SUCCEEDS. If a future change
+		// accidentally removes the SetAuthorizer(...) call in router.go,
+		// THIS is the behavioural difference a security test built against
+		// the "always refused" assumption would need to catch — and does:
+		// asserting refusal here, with no authorizer installed, FAILS.
+		unenforced := NewToolRegistry(nil, nil)
+		require.NoError(t, unenforced.RegisterCustomTool(newValidMockTool("Write")))
+
+		result, err := unenforced.ExecuteToolAs(context.Background(), "reader-skill", "Write", map[string]interface{}{"input": "x"})
+		require.NoError(t, err, "PAIRED-MUTATION PROOF: with the authorizer wiring stripped, an "+
+			"over-reaching call is NOT refused — this is exactly what a stripped T-P6.03 enforcement "+
+			"check produces, and is why the subtest above (with the authorizer installed) MUST assert refusal")
+		assert.NotNil(t, result)
+	})
+}
+
+// scriptedAuthorizer implements ToolCallAuthorizer from a fixed
+// actorID:toolName -> allowed table, refusing everything not listed.
+type scriptedAuthorizer struct {
+	allow map[string]bool
+}
+
+func (s scriptedAuthorizer) Authorize(actorID, toolName string) (bool, string) {
+	if s.allow[actorID+":"+toolName] {
+		return true, ""
+	}
+	return false, actorID + " is not authorized to call " + toolName
+}

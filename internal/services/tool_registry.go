@@ -5,10 +5,28 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"digital.vasic.concurrency/pkg/safe"
 )
+
+// ToolCallAuthorizer decides whether a named actor (typically a skill) may
+// invoke a named tool (HXC-159 T-P6.03, RS-14).
+//
+// Declared here — in package services, which skills already imports — so
+// package skills can implement it (mapping a *Skill's declared AllowedTools
+// onto tool-call permission) without services ever importing skills. That
+// avoids the import cycle a direct "package skills" reference here would
+// create, and keeps the enforcement point (ExecuteToolAs, below) generic:
+// ANY actor concept a future caller invents can supply its own
+// ToolCallAuthorizer without touching ToolRegistry again.
+type ToolCallAuthorizer interface {
+	// Authorize reports whether actorID may call toolName. reason is an
+	// operator-visible explanation used ONLY when allowed is false — it is
+	// never required to be non-empty when allowed is true.
+	Authorize(actorID, toolName string) (allowed bool, reason string)
+}
 
 // Tool represents a unified tool interface
 type Tool interface {
@@ -42,6 +60,15 @@ type ToolRegistry struct {
 	// the next refresh because its tools report a Source() other than
 	// "custom".
 	externalSources *safe.Store[string, func() ([]Tool, error)]
+	// authorizer, when set, gates every ExecuteToolAs call (T-P6.03,
+	// RS-14). nil means unrestricted — ExecuteTool (the pre-existing,
+	// non-actor-scoped entry point) is UNAFFECTED by this field; only
+	// ExecuteToolAs consults it, so callers that never adopt an actor
+	// concept see zero behaviour change. atomic.Pointer because
+	// SetAuthorizer (unlike mcpManager/lspClient) is called AFTER
+	// construction, so a concurrent ExecuteToolAs during that call must
+	// never observe a torn/partial write.
+	authorizer atomic.Pointer[ToolCallAuthorizer]
 }
 
 // NewToolRegistry creates a new tool registry
@@ -218,6 +245,51 @@ func (tr *ToolRegistry) GetTool(name string) (Tool, bool) {
 // ListTools returns all available tools
 func (tr *ToolRegistry) ListTools() []Tool {
 	return tr.tools.Values()
+}
+
+// SetAuthorizer installs the ToolCallAuthorizer ExecuteToolAs consults
+// (T-P6.03). Passing nil restores the unrestricted default. Safe to call
+// at any time; takes effect on the next ExecuteToolAs call.
+func (tr *ToolRegistry) SetAuthorizer(a ToolCallAuthorizer) {
+	if a == nil {
+		tr.authorizer.Store(nil)
+		return
+	}
+	tr.authorizer.Store(&a)
+}
+
+// ErrToolCallRefused is wrapped by the error ExecuteToolAs returns when the
+// installed ToolCallAuthorizer refuses actorID's use of a tool (T-P6.03,
+// RS-14). Callers can errors.Is against this to distinguish a policy
+// refusal from every other ExecuteTool failure mode (tool not found,
+// parameter validation, execution error).
+var ErrToolCallRefused = fmt.Errorf("tool call refused by authorizer")
+
+// ExecuteToolAs is the actor-scoped tool-call boundary (HXC-159 T-P6.03):
+// it enforces the installed ToolCallAuthorizer, if any, BEFORE delegating
+// to ExecuteTool. This is the intended call boundary for any caller
+// invoking a tool "as" a named actor (a skill, by name, in the reference
+// wiring — see skills.SkillAuthorizer); ExecuteTool itself stays
+// unrestricted for callers with no actor concept, so this method is
+// strictly additive.
+//
+// The pre-T-P6.03 state of this codebase had ParseAllowedTools (a skill's
+// declared tool permissions) parsed and NEVER enforced anywhere — a
+// Critical-severity gap (spec.md D6 / `03` §7.6): a skill declaring
+// AllowedTools="Read" could still successfully call Write, because no
+// caller ever consulted the parsed result at a real tool-call boundary.
+// ExecuteToolAs is that boundary.
+func (tr *ToolRegistry) ExecuteToolAs(ctx context.Context, actorID, toolName string, params map[string]interface{}) (interface{}, error) {
+	if authorizerPtr := tr.authorizer.Load(); authorizerPtr != nil {
+		allowed, reason := (*authorizerPtr).Authorize(actorID, toolName)
+		if !allowed {
+			if reason == "" {
+				reason = fmt.Sprintf("actor %q is not authorized to call tool %q", actorID, toolName)
+			}
+			return nil, fmt.Errorf("%w: %s", ErrToolCallRefused, reason)
+		}
+	}
+	return tr.ExecuteTool(ctx, toolName, params)
 }
 
 // ExecuteTool safely executes a tool with sandboxing
