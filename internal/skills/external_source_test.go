@@ -69,24 +69,85 @@ func TestExternalSkillSource_UnderCeilingIsAdmitted(t *testing.T) {
 	}
 }
 
-// TestExternalSkillSource_SimilarityConflictRefusesTheWholeSource proves
-// the ported description-similarity gate is genuinely reachable: two
-// skills whose descriptions collide above nativeSimilarityThreshold must
-// refuse the whole source.
-func TestExternalSkillSource_SimilarityConflictRefusesTheWholeSource(t *testing.T) {
+// TestExternalSkillSource_SimilarityConflictExcludesOnlyThePair proves the
+// HXC-159 F-17 (2026-09-23) per-skill (partial) admission redesign is
+// genuinely reachable through ExternalSkillSource.Load: two skills whose
+// descriptions collide above nativeSimilarityThreshold no longer refuse the
+// whole source — exactly ONE of the pair is admitted (the
+// alphabetically-first Qualified() identity per the tie-break rule) and a
+// third, unrelated skill in the same source still loads.
+func TestExternalSkillSource_SimilarityConflictExcludesOnlyThePair(t *testing.T) {
 	dir := t.TempDir()
 	// Two descriptions sharing every content token score Jaccard=1.0,
-	// far above nativeSimilarityThreshold (0.0256).
+	// far above nativeSimilarityThreshold (0.0709).
 	writeExternalSkill(t, dir, "alpha-skill", "validate recording screenshot capture evidence pipeline")
 	writeExternalSkill(t, dir, "beta-skill", "validate recording screenshot capture evidence pipeline")
+	writeExternalSkill(t, dir, "gamma-skill", "translate legal contracts between spanish and portuguese dialects")
 
 	src := NewExternalSkillSource("external", dir, nil)
 	tools, err := src.Load()
 	if err != nil {
-		t.Fatalf("Load returned an infrastructure error, expected a logged policy refusal with (nil, nil): %v", err)
+		t.Fatalf("Load returned an unexpected infrastructure error: %v", err)
 	}
-	if len(tools) != 0 {
-		t.Fatalf("a similarity-conflicting external source must admit ZERO tools, got %d", len(tools))
+	if len(tools) != 2 {
+		t.Fatalf("expected exactly 2 tools admitted (one of the confusable pair + the unrelated skill), got %d: %+v", len(tools), tools)
+	}
+	byName := map[string]bool{}
+	for _, tl := range tools {
+		byName[tl.Name()] = true
+	}
+	if byName["alpha-skill"] == byName["beta-skill"] {
+		t.Fatalf("exactly one of alpha-skill/beta-skill must be admitted, got both present=%v", byName["alpha-skill"] && byName["beta-skill"])
+	}
+	// external.alpha-skill < external.beta-skill lexicographically — the
+	// alphabetically-first identity is kept per the tie-break rule.
+	if !byName["alpha-skill"] {
+		t.Fatalf("tie-break must keep alpha-skill (alphabetically first), got %+v", byName)
+	}
+	if !byName["gamma-skill"] {
+		t.Fatalf("the unrelated, non-conflicting skill must still be admitted under partial admission, got %+v", byName)
+	}
+}
+
+// TestNativeAdmitBySimilarityNeverAdmitsBothOfAPair mirrors
+// pkg/skills.TestAdmitBySimilarityNeverAdmitsBothOfAPair on this native
+// port: the F-17 safety invariant this remediation MUST preserve is that no
+// path through nativeAdmitBySimilarity can ever return two mutually
+// confusable skills in the same admitted set.
+func TestNativeAdmitBySimilarityNeverAdmitsBothOfAPair(t *testing.T) {
+	mk := func(name, desc string) *Skill { return &Skill{Name: name, Description: desc} }
+	a := mk("alpha", "reconcile ledger balance entries nightly batch")
+	b := mk("bravo", "reconcile ledger balance entries nightly batch")
+	c := mk("charlie", "reconcile ledger balance entries nightly batch")
+	d := mk("delta", "compress seismic waveform telemetry for archival storage")
+	ordered := []*Skill{a, b, c, d} // already alphabetical by qualifiedName("clique", ·)
+
+	admitted, exclusions := nativeAdmitBySimilarity("clique", ordered)
+
+	for i := 0; i < len(admitted); i++ {
+		for j := i + 1; j < len(admitted); j++ {
+			if s := nativeJaccard(admitted[i].Description, admitted[j].Description); s > nativeSimilarityThreshold {
+				t.Fatalf("SAFETY VIOLATION: both %q and %q admitted with confusable score %.4f > threshold %.4f",
+					admitted[i].Name, admitted[j].Name, s, nativeSimilarityThreshold)
+			}
+		}
+	}
+	if len(admitted) != 2 {
+		t.Fatalf("expected exactly 2 admitted (one clique survivor + delta), got %d", len(admitted))
+	}
+	if admitted[0].Name != "alpha" {
+		t.Fatalf("expected the clique's alphabetically-first member admitted, got %q", admitted[0].Name)
+	}
+	if len(exclusions) != 2 {
+		t.Fatalf("expected exactly 2 exclusions (bravo, charlie both conflict with alpha), got %d: %+v", len(exclusions), exclusions)
+	}
+	for _, ex := range exclusions {
+		if ex.ConflictsWith != "clique.alpha" {
+			t.Fatalf("both clique exclusions must cite clique.alpha as the conflicting admitted skill, got %+v", ex)
+		}
+		if ex.String() == "" {
+			t.Fatal("nativeSimilarityExclusion.String() must produce a non-empty auditable message")
+		}
 	}
 }
 

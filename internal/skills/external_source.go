@@ -99,30 +99,17 @@ func NewExternalSkillSource(name, dir string, service *Service) *ExternalSkillSo
 // skill added to Dir after startup is picked up on the next refresh without
 // restarting the process.
 func (s *ExternalSkillSource) Load() ([]services.Tool, error) {
-	discovered, failures, err := s.parser.ParseDirectory(s.Dir)
+	discovered, admitted, exclusions, refusal, err := s.loadAndGate()
+	_ = discovered
 	if err != nil {
-		return nil, fmt.Errorf("skills: external source %q: %w", s.Name, err)
+		return nil, err
 	}
-	// T-P6.04 direction: malformed skills within an external source are
-	// surfaced (ParseDirectory already logged each at Warn), not silently
-	// dropped from the load — Load() itself does not error on them so the
-	// well-formed skills in the same source still register.
-	_ = failures
-
-	// HXC-159 T-P9.01/F-01: every discovered skill MUST cross the native
-	// policy gate (ceiling + description-similarity + C5 sandbox
-	// precondition, external_policy.go) before it is exposed as a Tool or
-	// registered into the backing skills.Service — discovery on disk no
-	// longer implies activation. A policy refusal admits ZERO skills from
-	// this Load() call (fail-closed over the whole source, matching
-	// pkg/skills.Registry.Activate's own all-or-nothing semantics) and is
-	// logged, not returned as an error — the caller's pre-existing
-	// contract (a malformed/refused external source never blocks other
-	// tiers the caller also loads) is preserved.
-	admitted, refusal := externalPolicyGate(s.Name, discovered, s.Trust, s.SandboxReady)
 	if refusal != nil {
 		logPolicyRefusal(s.Name, refusal)
 		return nil, nil
+	}
+	if len(exclusions) > 0 {
+		logPolicyExclusions(s.Name, exclusions)
 	}
 
 	tools := make([]services.Tool, 0, len(admitted))
@@ -140,6 +127,52 @@ func (s *ExternalSkillSource) Load() ([]services.Tool, error) {
 // fetcher closure.
 func (s *ExternalSkillSource) RegisterWith(registry *services.ToolRegistry) error {
 	return registry.RegisterExternalToolSource(s.Name, s.Load)
+}
+
+// loadAndGate parses ExternalSkillSource.Dir and runs the discovered set
+// through externalPolicyGate. It is the SINGLE place that logic lives —
+// both the production Load() (which discards exclusions/refusal detail
+// behind its (nil, nil) fail-closed contract) and the diagnostic
+// LoadForProbe() (which needs the full detail for cross-implementation
+// parity testing against pkg/skills' own similarity-probe, HXC-159 F-17)
+// call through it, so there is exactly one code path that can drift from
+// the real production behaviour.
+func (s *ExternalSkillSource) loadAndGate() (discovered []*Skill, admitted []*Skill, exclusions []nativeSimilarityExclusion, refusal error, err error) {
+	discovered, failures, parseErr := s.parser.ParseDirectory(s.Dir)
+	if parseErr != nil {
+		return nil, nil, nil, nil, fmt.Errorf("skills: external source %q: %w", s.Name, parseErr)
+	}
+	// T-P6.04 direction: malformed skills within an external source are
+	// surfaced (ParseDirectory already logged each at Warn), not silently
+	// dropped from the load.
+	_ = failures
+
+	admitted, exclusions, refusal = externalPolicyGate(s.Name, discovered, s.Trust, s.SandboxReady)
+	return discovered, admitted, exclusions, refusal, nil
+}
+
+// LoadForProbe is a diagnostic-only export (HXC-159 F-17, 2026-09-23,
+// cmd/similarity-probe) exposing the FULL policy-gate detail (admitted
+// tools + per-skill similarity exclusions + any whole-set refusal) that
+// production Load() deliberately collapses to a fail-closed (nil, nil) on
+// refusal. It performs NO side effects (does not register into a
+// skills.Service) and is not part of the production activation path —
+// exists solely so an external diagnostic/parity harness can observe
+// exactly what the policy engine decided and why, without duplicating
+// loadAndGate's logic.
+func (s *ExternalSkillSource) LoadForProbe() (tools []services.Tool, exclusions []nativeSimilarityExclusion, refusal error, err error) {
+	_, admitted, excl, ref, loadErr := s.loadAndGate()
+	if loadErr != nil {
+		return nil, nil, nil, loadErr
+	}
+	if ref != nil {
+		return nil, nil, ref, nil
+	}
+	out := make([]services.Tool, 0, len(admitted))
+	for _, sk := range admitted {
+		out = append(out, &skillToolAdapter{skill: sk, source: s.Name})
+	}
+	return out, excl, nil, nil
 }
 
 // skillToolAdapter adapts a *Skill to the services.Tool interface so it

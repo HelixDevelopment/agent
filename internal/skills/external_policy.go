@@ -173,22 +173,24 @@ func (e *nativeCeilingExceededError) Error() string {
 		e.Count, e.Ceiling, e.Offender)
 }
 
-// nativeSimilarityConflictError mirrors pkg/skills.SimilarityConflictError.
-type nativeSimilarityConflictError struct {
-	A, B      string
-	Score     float64
-	Threshold float64
+// nativeSimilarityExclusion mirrors pkg/skills.SimilarityExclusion (HXC-159
+// F-17, 2026-09-23): the admission model moved from whole-tier fail-closed
+// to per-skill (partial) admission. It is the per-skill audit record
+// produced when the description-similarity gate excludes ONE member of a
+// confusable pair — names the excluded skill, the already-admitted skill it
+// conflicts with, the measured score, and the threshold — never a bare
+// boolean and never an opaque partial list. MUST be kept in lockstep with
+// pkg/skills.SimilarityExclusion per this file's mirroring mandate.
+type nativeSimilarityExclusion struct {
+	Excluded      string
+	ConflictsWith string
+	Score         float64
+	Threshold     float64
 }
 
-func (e *nativeSimilarityConflictError) Error() string {
-	// HXC-159 F-17 (2026-09-23): mirrors pkg/skills.SimilarityConflictError's
-	// message fix — the "NON-SEPARABLE fallback" clause was a hardcoded
-	// calibration-outcome claim that drifts the moment the shared corpus is
-	// recalibrated (the current corpus IS separable; see
-	// scripts/benchmark_skills/threshold.json). MUST be kept byte-identical
-	// in shape to pkg/skills' message per this file's mirroring mandate.
-	return fmt.Sprintf("skills: external source active pair %q || %q scores %.4f above similarity threshold %.4f (see threshold.json for the current calibration) — refusing; drop or rename one description",
-		e.A, e.B, e.Score, e.Threshold)
+func (e nativeSimilarityExclusion) String() string {
+	return fmt.Sprintf("skills: external source %q excluded — scores %.4f above similarity threshold %.4f against already-admitted %q (see threshold.json for the current calibration); the alphabetically-later member of a confusable pair is excluded so the earlier one may still load",
+		e.Excluded, e.Score, e.Threshold, e.ConflictsWith)
 }
 
 // nativeThirdPartyBlockedError mirrors pkg/skills.ThirdPartyActivationBlockedError.
@@ -210,24 +212,40 @@ func qualifiedName(sourceName string, s *Skill) string {
 
 // externalPolicyGate is the native, non-importing port of
 // pkg/skills.Registry.Activate's enforcement order (ceiling, then
-// similarity, then the C5 sandbox precondition — capability-based refusal
-// is SkillAuthorizer's separate, pre-existing job and is not part of this
-// gate). discovered is every skill ParseDirectory found in the source
-// directory for THIS Load() call; the "allowlist" is implicitly every
-// discovered skill's qualified name (mirroring this same fix's helix_code
-// counterpart, internal/agent/skill_external_policy.go, which makes the
-// identical simplification for the same reason: an external tier has no
-// separate allowlist file of its own, the directory listing itself is the
-// declared set of candidates for policy admission).
+// per-skill similarity admission, then the C5 sandbox precondition —
+// capability-based refusal is SkillAuthorizer's separate, pre-existing job
+// and is not part of this gate). discovered is every skill ParseDirectory
+// found in the source directory for THIS Load() call; the "allowlist" is
+// implicitly every discovered skill's qualified name (mirroring this same
+// fix's helix_code counterpart, internal/agent/skill_external_policy.go,
+// which makes the identical simplification for the same reason: an
+// external tier has no separate allowlist file of its own, the directory
+// listing itself is the declared set of candidates for policy admission).
 //
-// On success, active is every discovered skill (policy admits the whole
-// tier). On a policy refusal (ceiling / similarity / sandbox), active is
-// nil and refusal names exactly which rule fired and why — the caller
-// (ExternalSkillSource.Load) treats this as "admit zero skills from this
-// source this cycle", never a partial admission.
-func externalPolicyGate(sourceName string, discovered []*Skill, trust ExternalSourceTrust, sandboxReady bool) (active []*Skill, refusal error) {
+// HXC-159 F-17 (2026-09-23) redesign: the description-similarity check is
+// no longer whole-source fail-closed. A confusable PAIR excludes only its
+// alphabetically-later member (candidates are walked in the SAME
+// deterministic ascending-Qualified()-identity order the ceiling check
+// already sorted them into) — every other, non-conflicting skill in the
+// source still admits, even when an unrelated pair elsewhere in the same
+// source conflicts. exclusions names every excluded skill + which
+// already-admitted skill it conflicted with + the score, mirroring
+// pkg/skills.admitBySimilarity byte-for-byte in algorithm (see that
+// function's doc comment for the maximal-independent-set proof this port
+// preserves: no two mutually confusable skills can ever both appear in
+// active).
+//
+// Ceiling and the C5 sandbox precondition remain WHOLE-SET refusals
+// (unchanged by F-17): a ceiling breach is a resource-budget concern over
+// the whole candidate set, and the sandbox precondition is a readiness
+// gate on the whole admitted set — neither is a pairwise conflict, so
+// neither is a candidate for partial admission. On EITHER of those
+// refusals active is nil and refusal names exactly which rule fired and
+// why; on a genuine similarity conflict, refusal stays nil and active +
+// exclusions together describe the partial outcome.
+func externalPolicyGate(sourceName string, discovered []*Skill, trust ExternalSourceTrust, sandboxReady bool) (active []*Skill, exclusions []nativeSimilarityExclusion, refusal error) {
 	if len(discovered) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	ordered := make([]*Skill, len(discovered))
@@ -238,36 +256,59 @@ func externalPolicyGate(sourceName string, discovered []*Skill, trust ExternalSo
 
 	if len(ordered) > nativeDefaultCeiling {
 		offender := qualifiedName(sourceName, ordered[nativeDefaultCeiling])
-		return nil, &nativeCeilingExceededError{
+		return nil, nil, &nativeCeilingExceededError{
 			Ceiling:  nativeDefaultCeiling,
 			Count:    len(ordered),
 			Offender: offender,
 		}
 	}
 
-	for i := 0; i < len(ordered); i++ {
-		for j := i + 1; j < len(ordered); j++ {
-			score := nativeJaccard(ordered[i].Description, ordered[j].Description)
-			if score > nativeSimilarityThreshold {
-				return nil, &nativeSimilarityConflictError{
-					A:         qualifiedName(sourceName, ordered[i]),
-					B:         qualifiedName(sourceName, ordered[j]),
-					Score:     score,
-					Threshold: nativeSimilarityThreshold,
-				}
-			}
-		}
-	}
+	admitted, excl := nativeAdmitBySimilarity(sourceName, ordered)
 
 	if trust == TrustThirdParty && !sandboxReady {
-		offenders := make([]string, len(ordered))
-		for i, s := range ordered {
+		offenders := make([]string, len(admitted))
+		for i, s := range admitted {
 			offenders[i] = qualifiedName(sourceName, s)
 		}
-		return nil, &nativeThirdPartyBlockedError{Offenders: offenders}
+		return nil, nil, &nativeThirdPartyBlockedError{Offenders: offenders}
 	}
 
-	return ordered, nil
+	return admitted, excl, nil
+}
+
+// nativeAdmitBySimilarity is the byte-for-byte native port of
+// pkg/skills.admitBySimilarity (HXC-159 F-17, 2026-09-23). ordered MUST
+// already be sorted in ascending Qualified()-identity order (externalPolicyGate
+// guarantees this). Each candidate is checked against the FULL
+// admitted-so-far set — not merely its original pairing — so the returned
+// admitted slice is a maximal independent set of the pairwise-confusability
+// graph: it is impossible for two mutually confusable skills to both
+// appear in it. Tie-break rule (mirrors pkg/skills, MUST stay identical):
+// for any confusable pair, the alphabetically-first Qualified() identity is
+// kept and the later one is excluded.
+func nativeAdmitBySimilarity(sourceName string, ordered []*Skill) (admitted []*Skill, exclusions []nativeSimilarityExclusion) {
+	for _, c := range ordered {
+		conflictsWith := ""
+		var score float64
+		for _, a := range admitted {
+			if s := nativeJaccard(c.Description, a.Description); s > nativeSimilarityThreshold {
+				conflictsWith = qualifiedName(sourceName, a)
+				score = s
+				break
+			}
+		}
+		if conflictsWith != "" {
+			exclusions = append(exclusions, nativeSimilarityExclusion{
+				Excluded:      qualifiedName(sourceName, c),
+				ConflictsWith: conflictsWith,
+				Score:         score,
+				Threshold:     nativeSimilarityThreshold,
+			})
+			continue
+		}
+		admitted = append(admitted, c)
+	}
+	return admitted, exclusions
 }
 
 // logPolicyRefusal is the single place ExternalSkillSource.Load logs a
@@ -277,4 +318,16 @@ func externalPolicyGate(sourceName string, discovered []*Skill, trust ExternalSo
 // without touching externalPolicyGate's pure decision logic.
 func logPolicyRefusal(sourceName string, refusal error) {
 	log.Printf("⚠️  skills: external source %q refused by policy: %v", sourceName, refusal)
+}
+
+// logPolicyExclusions is the single place ExternalSkillSource.Load logs
+// per-skill similarity exclusions under the HXC-159 F-17 partial-admission
+// model — one auditable line per excluded skill, naming exactly which
+// already-admitted skill it conflicted with and at what score, so an
+// operator can see what happened and why without re-deriving it from the
+// admitted list's absence.
+func logPolicyExclusions(sourceName string, exclusions []nativeSimilarityExclusion) {
+	for _, ex := range exclusions {
+		log.Printf("⚠️  skills: external source %q: %s", sourceName, ex.String())
+	}
 }
