@@ -341,7 +341,27 @@ type ParseFailure struct {
 	Error string
 }
 
-// ParseDirectory recursively parses all SKILL.md files in a directory.
+// ParseDirectory recursively parses all SKILL.md files in a directory,
+// following symlinked subdirectories (HXC-159 T-P9.01 round-4 finding
+// F-23).
+//
+// The prior implementation walked with filepath.Walk, which does NOT
+// follow directory symlinks: os.FileInfo.IsDir() for a symlinked directory
+// reports false (it inspects the raw directory-entry type bits, never
+// resolves the link), so Walk silently skips descending into it.
+// scripts/register_skills.sh (T-P1.04) provisions the registrar's real
+// output directory (`.claude/skills/`) as EXACTLY that shape — every
+// entry a symlink into constitution/skills/<name> or the §11.4.272
+// activation-engine pool — so pointed at that directory the old
+// implementation returned admitted=[]/refusal=""/err=nil: a silent-empty
+// §11.4.201(6) false-null, the same defect class F-03 already closed for
+// the sibling library's copy of this walk
+// (submodules/skills/pkg/skills/loader.go:walkForManifests, cited there
+// as "helix_code's own SEPARATE loader ... hit and fixed the identical
+// defect earlier the same review round"). This mirrors that fix's
+// approach (EvalSymlinks + a visited-set to guard cycles) inside this
+// package's own ParseDirectory so every caller — Registry.Load,
+// ExternalSkillSource.Load — inherits the fix without a second import.
 //
 // T-P6.04 fail-loud-and-continue (documented choice, NOT fail-closed): a
 // malformed SKILL.md is surfaced in the returned []ParseFailure — logged at
@@ -362,21 +382,66 @@ func (p *Parser) ParseDirectory(dir string) ([]*Skill, []ParseFailure, error) {
 	skills := make([]*Skill, 0)
 	var failures []ParseFailure
 
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
+	// visited holds symlink-resolved (real) directory paths already
+	// walked, so a symlink cycle (directly or transitively pointing back
+	// at an ancestor) terminates instead of recursing forever.
+	visited := make(map[string]bool)
 
-		if !info.IsDir() && strings.ToUpper(info.Name()) == "SKILL.MD" {
-			skill, parseErr := p.ParseFile(path)
+	var walk func(path string) error
+	walk = func(path string) error {
+		real, evalErr := filepath.EvalSymlinks(path)
+		if evalErr != nil {
+			// Dangling symlink, or a permission error resolving it — skip
+			// this one entry rather than failing the whole walk (matches
+			// the pre-existing os.IsNotExist tolerance elsewhere in this
+			// package).
+			return nil
+		}
+		if visited[real] {
+			return nil
+		}
+		visited[real] = true
+
+		entries, readErr := os.ReadDir(path)
+		if readErr != nil {
+			return readErr
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if name == ".git" {
+				continue
+			}
+			full := filepath.Join(path, name)
+
+			isDir := entry.IsDir()
+			if !isDir && entry.Type()&os.ModeSymlink != 0 {
+				// A symlink entry: IsDir() on the raw DirEntry always
+				// reports false for a symlink (it never resolves the
+				// link) — resolve it explicitly to find out whether it
+				// points at a directory.
+				if info, statErr := os.Stat(full); statErr == nil && info.IsDir() {
+					isDir = true
+				}
+			}
+			if isDir {
+				if err := walk(full); err != nil {
+					return err
+				}
+				continue
+			}
+
+			if strings.ToUpper(name) != "SKILL.MD" {
+				continue
+			}
+			skill, parseErr := p.ParseFile(full)
 			if parseErr != nil {
 				// Raised from Debug to Warn (T-P6.04.2): a malformed skill
 				// MUST be operator-visible, never a silent Debug-only entry
 				// a live deployment never reads.
-				logrus.WithError(parseErr).WithField("path", path).
+				logrus.WithError(parseErr).WithField("path", full).
 					Warn("Skill file failed to parse — surfaced in load report, not silently skipped")
-				failures = append(failures, ParseFailure{Path: path, Error: parseErr.Error()})
-				return nil
+				failures = append(failures, ParseFailure{Path: full, Error: parseErr.Error()})
+				continue
 			}
 			// HXC-159 T-P9.01 F-16 (round-3 review fix): a SKILL.md with no
 			// YAML front-matter block (or a block without `name:`) parses
@@ -392,18 +457,17 @@ func (p *Parser) ParseDirectory(dir string) ([]*Skill, []ParseFailure, error) {
 			// separate design decision and is NOT made by this check.
 			if skill.Name == "" {
 				reason := "front-matter carries no name: (or no front-matter block at all) — an unnamed skill cannot be registered (Registry keys by name); add a YAML front-matter block with name: and description:"
-				logrus.WithField("path", path).
+				logrus.WithField("path", full).
 					Warn("Skill file has no front-matter name — surfaced in load report, not silently dropped (HXC-159 F-16)")
-				failures = append(failures, ParseFailure{Path: path, Error: reason})
-				return nil
+				failures = append(failures, ParseFailure{Path: full, Error: reason})
+				continue
 			}
 			skills = append(skills, skill)
 		}
-
 		return nil
-	})
+	}
 
-	if err != nil {
+	if err := walk(dir); err != nil {
 		return nil, nil, fmt.Errorf("failed to walk directory: %w", err)
 	}
 
