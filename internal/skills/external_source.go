@@ -30,6 +30,17 @@ import (
 // imports github.com/HelixDevelopment/skills as a Go module. See
 // tests/compliance/module_graph_edge_test.go (T-P6.05) for the mechanical
 // gate that enforces the module graph never grows that edge.
+//
+// HXC-159 T-P9.01/F-01: Load() previously implied activation by returning
+// every skill ParseDirectory discovered, with none of the P4 activation
+// policy (allowlist, activation ceiling, description-similarity gate, C5
+// sandbox precondition) ever consulted — that policy existed only inside
+// github.com/HelixDevelopment/skills, a library this package structurally
+// cannot import (D-4 above). external_policy.go is a NATIVE,
+// non-importing reimplementation of that SAME policy (ported verbatim from
+// pkg/skills/activate.go + similarity.go + sandbox_gate.go, cited there),
+// and Load() now runs every discovered skill through it before returning
+// or registering anything.
 type ExternalSkillSource struct {
 	// Name identifies the source (the sourceName RegisterExternalToolSource
 	// and every Tool.Source() will report).
@@ -38,12 +49,27 @@ type ExternalSkillSource struct {
 	// config-injected by the caller (CONST-051(B): this package stays
 	// project-not-aware; it never hardcodes a path).
 	Dir string
+	// Trust classifies this source for the C5 sandbox precondition
+	// (HXC-159 F-01). Config-injected by the caller; the zero value is
+	// TrustVendored, matching this consumer's pre-existing self-report in
+	// internal/skillconformance/report.go's trustForTier("external").
+	Trust ExternalSourceTrust
+	// SandboxReady declares whether a REAL (non-skip) isolated executor
+	// backs this consumer's third-party-tier skill execution path (C5
+	// precondition). Config-injected, never hardcoded true: HelixAgent has
+	// not wired a real sandbox executor as of this fix, so callers MUST
+	// leave this false — hardcoding true here would be exactly the bluff
+	// F-02 closed inside pkg/skills itself.
+	SandboxReady bool
 
 	parser  *Parser
 	service *Service // may be nil: Load() then registers ToolRegistry-only
 }
 
-// NewExternalSkillSource constructs a source rooted at dir. service is the
+// NewExternalSkillSource constructs a source rooted at dir, defaulting to
+// TrustVendored with SandboxReady=false (HXC-159 F-01's safe default —
+// callers needing TrustThirdParty or a wired sandbox set ExternalSkillSource
+// 's exported fields directly after construction). service is the
 // skills.Service backing the consumer's HTTP routes; pass nil to register
 // only into a services.ToolRegistry (e.g. a caller that has no skills.Service
 // of its own) — Load() still returns the fetched Tools in that case, it
@@ -52,6 +78,7 @@ func NewExternalSkillSource(name, dir string, service *Service) *ExternalSkillSo
 	return &ExternalSkillSource{
 		Name:    name,
 		Dir:     dir,
+		Trust:   TrustVendored,
 		parser:  NewParser(),
 		service: service,
 	}
@@ -82,8 +109,24 @@ func (s *ExternalSkillSource) Load() ([]services.Tool, error) {
 	// well-formed skills in the same source still register.
 	_ = failures
 
-	tools := make([]services.Tool, 0, len(discovered))
-	for _, sk := range discovered {
+	// HXC-159 T-P9.01/F-01: every discovered skill MUST cross the native
+	// policy gate (ceiling + description-similarity + C5 sandbox
+	// precondition, external_policy.go) before it is exposed as a Tool or
+	// registered into the backing skills.Service — discovery on disk no
+	// longer implies activation. A policy refusal admits ZERO skills from
+	// this Load() call (fail-closed over the whole source, matching
+	// pkg/skills.Registry.Activate's own all-or-nothing semantics) and is
+	// logged, not returned as an error — the caller's pre-existing
+	// contract (a malformed/refused external source never blocks other
+	// tiers the caller also loads) is preserved.
+	admitted, refusal := externalPolicyGate(s.Name, discovered, s.Trust, s.SandboxReady)
+	if refusal != nil {
+		logPolicyRefusal(s.Name, refusal)
+		return nil, nil
+	}
+
+	tools := make([]services.Tool, 0, len(admitted))
+	for _, sk := range admitted {
 		if s.service != nil {
 			s.service.RegisterSkill(sk)
 		}
