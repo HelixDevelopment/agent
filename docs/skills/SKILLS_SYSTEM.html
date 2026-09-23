@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc 3.11" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>SKILLS_SYSTEM</title>
+  <style>
+
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+
+ul.task-list[class]{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+font-size: inherit;
+width: 0.8em;
+margin: 0 0.8em 0.2em -1.6em;
+vertical-align: middle;
+}
+</style>
+  <style type="text/css">
+table {
+border-collapse: collapse;
+}
+table td,
+table th {
+border: 1px solid #cccccc;
+padding: 4px 8px;
+vertical-align: top;
+}
+
+tr.cell-status-obsolete > td {
+background-color: #E0E0E0;
+}
+
+tr.cell-status-obsolete > td:nth-child(2),
+tr.cell-status-obsolete > td:last-child {
+text-decoration: line-through;
+}
+</style>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">SKILLS_SYSTEM</h1>
+</header>
+<h1 id="helixagent-skills-system-hxc-159-t-p8.01.2">HelixAgent skills
+system (HXC-159 T-P8.01.2)</h1>
+<p><strong>Revision</strong>: 1 · <strong>Last modified</strong>:
+2026-09-23 · <strong>Status</strong>: current</p>
+<p>This document describes HelixAgent’s own Agent Skills subsystem — the
+fuller capability-enforcement model (<code>AllowedTools</code>,
+content-hash provenance pinning, external tool-source registration,
+sandbox-precondition gating) that sits alongside, and interoperates
+with, the lighter-weight HelixCode TUI/CLI skill mechanism. It was
+written as part of HXC-159 Phase P8 to close a real documentation gap:
+prior to this revision, <code>docs/skills/</code> in this submodule
+contained only a single skill <em>file</em>
+(<code>development/SKILL.md</code>, itself a documentation-writing
+skill), not a description of the skills <em>system</em>.</p>
+<p>See also:</p>
+<ul>
+<li><a href="../../../../helix_code/docs/CAPABILITIES.md">HelixCode’s
+<code>docs/CAPABILITIES.md</code> §4/§10.5</a> — the sibling consumer’s
+own skill wiring, with verified <code>file:line</code> citations, and
+the cross-consumer parity gate this document’s §5 describes from the
+HelixAgent side.</li>
+<li><a href="../../../../helix_code/docs/guides/skills_user_manual.md">HelixCode’s
+<code>docs/guides/skills_user_manual.md</code></a> and <a href="../../../../helix_code/docs/guides/skills_faq.md"><code>skills_faq.md</code></a>
+— the operator-facing manual + FAQ covering both consumers.</li>
+<li><a href="development/SKILL.md"><code>docs/skills/development/SKILL.md</code></a>
+— a real, loaded skill file (documentation-writing), useful as an
+authoring template.</li>
+</ul>
+<h2 id="why-helixagent-is-a-client-never-an-importer-d-4">1. Why
+HelixAgent is a client, never an importer (D-4)</h2>
+<p>This is the single most load-bearing architectural fact about how
+HelixAgent consumes skills, and it is enforced mechanically, not merely
+documented. The upstream <code>HelixDevelopment/HelixSkills</code>
+submodule’s own <code>helix-deps.yaml</code> already declares
+<code>HelixDevelopment/HelixAgent</code> as <strong>its</strong>
+dependency. If HelixAgent’s own code imported the skills library as a Go
+package, that would invert the edge and create a dependency cycle —
+CONST-051(C) forbids exactly the nested own-org submodule chain that
+would result.</p>
+<p><strong>HelixAgent consumes skills exclusively as a client</strong>,
+through a registered external tool source, never a direct Go import of
+the skills library’s internal packages. This is verified by a
+module-graph edge gate (HXC-159 T-P6.05) that scans HelixAgent’s full
+dependency graph and asserts zero edges into the skills module —
+<code>git diff --stat -- go.mod go.sum</code> stays empty in this
+submodule’s tree throughout the skill-loading work.</p>
+<h2 id="loading-skills-internalskillsloader.go">2. Loading skills —
+<code>internal/skills/loader.go</code></h2>
+<p><code>SkillLoader</code> (<code>internal/skills/loader.go:14</code>)
+is HelixAgent’s own skill loader, distinct from HelixCode’s
+<code>commands.SkillLoader</code>. Key entry points:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Function</th>
+<th>Location</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>NewSkillLoader(registry *Registry)</code></td>
+<td><code>loader.go:29</code></td>
+<td>Construct a loader bound to a registry.</td>
+</tr>
+<tr>
+<td><code>LoadFromDirectory(dir string)</code></td>
+<td><code>loader.go:44</code></td>
+<td>Load every skill <code>.md</code> file from one directory.</td>
+</tr>
+<tr>
+<td><code>LoadFromConfig(cfg *LoaderConfig)</code></td>
+<td><code>loader.go:99</code></td>
+<td>Load from a declared multi-directory config (the config-injected
+equivalent of HelixCode’s <code>AllSkillsDirs</code> tier list — see
+§3).</td>
+</tr>
+<tr>
+<td><code>LoadBuiltinSkills()</code></td>
+<td><code>loader.go:148</code></td>
+<td>Load the embedded built-in skill set.</td>
+</tr>
+<tr>
+<td><code>GetInventory()</code></td>
+<td><code>loader.go:241</code></td>
+<td>Return a <code>SkillInventory</code> (<code>loader.go:224</code>) —
+the full loaded-skill census, used by the conformance reporter
+(§4).</td>
+</tr>
+</tbody>
+</table>
+<h2 id="declared-capability-enforcement-allowedtools">3. Declared
+capability enforcement — <code>AllowedTools</code></h2>
+<p>Each skill’s front-matter may declare <code>allowed-tools</code>
+(<code>internal/skills/types.go:16</code>, JSON tag
+<code>allowed_tools</code>), parsed into a structured list by
+<code>ParseAllowedTools</code> (<code>types.go:179</code>).</p>
+<p>At the tool-call boundary,
+<code>SkillAuthorizer.Authorize(actorID, toolName)</code>
+(<code>internal/skills/authorizer.go:56</code>) makes the enforcement
+decision:</p>
+<ul>
+<li>A skill whose <code>AllowedTools</code> is
+<strong>non-empty</strong> and does not name the requested tool is
+<strong>refused</strong> — checked via <code>skillDeclaresTool</code>
+(<code>authorizer.go:101</code>).</li>
+<li>A skill with an <strong>empty</strong> <code>AllowedTools</code> is
+a deliberate, backward-compatible <strong>allow-all</strong>
+(<code>authorizer.go:35</code>) — a skill authored before this
+capability model existed still works unchanged.</li>
+<li>Every authorization decision (allowed or refused) is appended to an
+audit log retrievable via <code>AuditLog()</code>
+(<code>authorizer.go:88</code>).</li>
+</ul>
+<p><code>SkillAuthorizer</code> is constructed against a
+<code>*Service</code> (<code>NewSkillAuthorizer(service)</code>,
+<code>authorizer.go:51</code>; <code>Service</code> type at
+<code>internal/skills/service.go:15</code>, constructed via
+<code>NewService(config)</code> at <code>service.go:26</code>) — the
+<code>Service</code> is HelixAgent’s own skill-management facade that
+owns the loaded-skill registry the authorizer consults.</p>
+<h2 id="content-hash-provenance-pinning">4. Content-hash provenance
+pinning</h2>
+<p>A skill’s origin can be pinned by content hash rather than by a
+mutable file path — this is recorded per-skill on the capability
+manifest both consumers generate, as the
+<code>content_hash_provenance</code> flag
+(<code>internal/skillconformance/manifest.go:49</code>, part of the
+<code>CapabilityManifest</code> schema at <code>manifest.go:69</code>,
+validated by <code>Validate()</code> at <code>manifest.go:81</code>).
+Pinning by content hash means a skill’s identity survives a path rename
+but NOT a body edit — an edited skill is, correctly, a
+<em>different</em> pinned artifact, so a downstream consumer relying on
+the pin is never silently handed a modified skill under the same
+reference.</p>
+<h2 id="external-tool-source-registration-the-cross-consumer-parity-gate">5.
+External tool-source registration + the cross-consumer parity gate</h2>
+<p><code>ExternalSkillSource.RegisterWith(registry *services.ToolRegistry)</code>
+(<code>internal/skills/external_source.go:98</code>) is the mechanism by
+which a skill loaded from an external directory becomes a callable tool:
+it calls
+<code>ToolRegistry.RegisterExternalToolSource(sourceName, toolFetcher)</code>
+(<code>internal/services/tool_registry.go:159</code>), the SAME
+general-purpose external-tool-source registration path other non-skill
+tool providers use. The external source directory itself is
+config-injected via the <code>HELIXSKILLS_EXTERNAL_SOURCE_DIR</code>
+environment variable (<code>internal/router/router.go:353,373</code>) —
+never hardcoded — because this submodule has no
+<code>constitution/</code> checkout of its own, so its source path must
+be resolvable from outside.</p>
+<p><strong>This submodule’s own capability manifest is generated
+independently</strong> by <code>internal/skillconformance</code> (a
+submodule-local re-implementation of the shared schema, never an import
+— per D-4/D-3, §1) from this submodule’s REAL production loader
+(<code>skills.Service</code> + <code>skills.SkillAuthorizer</code>),
+never a mock. <code>helix_code</code>’s sibling
+<code>internal/skillconformance</code> package does the same from ITS
+OWN real loader. <code>CM-CROSS-CONSUMER-PARITY</code>
+(<code>helix_code/cmd/skillparity</code>) diffs the two reports and
+fails on any unexplained asymmetry — <strong>at the time of this
+revision, running it over the same fixture corpus surfaces a real,
+currently-unmarked gap</strong>: this submodule’s report declares
+<code>capability_declaration</code> /
+<code>capability_enforcement</code> / <code>audit_log</code> surfaces
+(via <code>SkillAuthorizer</code>, this document’s §3) that HelixCode’s
+own TUI/CLI loader does not yet implement. See
+<code>docs/guides/skills_faq.md</code> in <code>helix_code</code> for
+the operator-facing explanation of this gap and what to do if you are
+closing it.</p>
+<h2 id="trust-tiers-the-sandbox-precondition-c5">6. Trust tiers + the
+sandbox precondition (C5)</h2>
+<p>A skill’s trust tier gates whether it is eligible for execution at
+all.
+<code>EnforceSandboxPrecondition(active []Skill, sandboxReady bool)</code>
+(<code>submodules/skills/pkg/skills/sandbox_gate.go:49</code>, a shared,
+project-agnostic package this submodule consumes as a client per §1)
+refuses activation of <strong>any</strong> <code>third-party</code>-tier
+skill while <code>sandboxReady</code> is <code>false</code>
+(<code>ThirdPartyActivationBlockedError</code>,
+<code>sandbox_gate.go:34</code>). As of this revision
+<code>sandboxReady</code> is honestly <code>false</code> in every
+deployment, because the only shipped <code>IsolatedExecutor</code>
+implementation is a deliberate no-op stand-in
+(<code>SkipIsolatedExecutor</code>) — there is no real sandbox executor
+yet. This is a <strong>precondition gate, not a permanent ban</strong>:
+once a real <code>IsolatedExecutor</code> lands upstream and
+<code>sandboxReady=true</code> is passed, <code>third-party</code>-tier
+skills become eligible without any further code change here.
+<code>vendored</code> and <code>built-in</code> tier skills are
+unaffected by this gate and run today.</p>
+<h2 id="summary-what-p4p7-actually-built-for-readers-of-older-phase-notes">7.
+Summary: what P4–P7 actually built (for readers of older phase
+notes)</h2>
+<p>Readers cross-referencing earlier HXC-159 phase reports should map
+the following task-id shorthand onto the sections above:</p>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Phase / task</th>
+<th>What it built</th>
+<th>Where it lives now</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>T-P4.05</td>
+<td>The declared-capability model (<code>allowed-tools</code>
+parsing)</td>
+<td>§3 (<code>types.go:179</code>)</td>
+</tr>
+<tr>
+<td>T-P6.01 / T-P6.03</td>
+<td>External tool-source registration +
+<code>SkillAuthorizer</code></td>
+<td>§5, §3</td>
+</tr>
+<tr>
+<td>T-P6.05</td>
+<td>The module-graph edge gate enforcing D-4</td>
+<td>§1</td>
+</tr>
+<tr>
+<td>T-P7.01</td>
+<td>The library-owned conformance suite + independent per-consumer
+re-implementations</td>
+<td>§5</td>
+</tr>
+<tr>
+<td>T-P7.02</td>
+<td>The cross-consumer parity gate
+<code>CM-CROSS-CONSUMER-PARITY</code></td>
+<td>§5</td>
+</tr>
+<tr>
+<td>T-P7.03</td>
+<td>Content-hash provenance pinning</td>
+<td>§4</td>
+</tr>
+<tr>
+<td>T-P7.05.5</td>
+<td>The C5 sandbox-precondition gate (closing the “refusal belongs to a
+gate that doesn’t exist yet” doc-comment gap)</td>
+<td>§6</td>
+</tr>
+</tbody>
+</table>
+<h2 id="sources-verified-2026-09-23">Sources verified 2026-09-23</h2>
+<p>Every citation above was mechanically opened at its cited line and
+its claimed symbol confirmed present, covering:
+<code>internal/skills/loader.go</code>,
+<code>internal/skills/authorizer.go</code>,
+<code>internal/skills/external_source.go</code>,
+<code>internal/skills/types.go</code>,
+<code>internal/skills/service.go</code>,
+<code>internal/services/tool_registry.go</code>,
+<code>internal/router/router.go</code>,
+<code>internal/skillconformance/manifest.go</code> (this submodule), and
+<code>submodules/skills/pkg/skills/sandbox_gate.go</code> (the shared,
+project-agnostic skills library this submodule consumes as a client).
+Runtime signature:
+<code>qa-results/hxc159/docs_update/&lt;run-id&gt;/</code> (see the
+meta-repo T-P8.01 completion evidence).</p>
+</body>
+</html>
