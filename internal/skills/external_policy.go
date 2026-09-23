@@ -45,11 +45,17 @@ import (
 const nativeDefaultCeiling = 20
 
 // nativeSimilarityThreshold mirrors pkg/skills.SimilarityThreshold
-// (T-P2.04 calibration: the Jaccard-token metric is NON-SEPARABLE on the
-// calibration corpus, so the threshold falls back to
-// min(known_confusable)=0.0256 with the false-positive risk explicitly
-// accepted — see pkg/skills/similarity.go for the full calibration note).
-const nativeSimilarityThreshold = 0.0256
+// (HXC-159 F-17 recalibration, 2026-09-23: the ORIGINAL T-P2.04
+// calibration mixed the real co-activated corpus with corpus-2's
+// unrelated postgres-mcp skills, which are TrustVendored and never in
+// the default allowlist -- that mixing pulled the threshold down to a
+// non-separable 0.0256 that then refused the real corpus on its own
+// governance-skill descriptions. On the REAL co-activated corpus the
+// metric IS separable: threshold=0.0709, fp_risk_accepted=false — see
+// pkg/skills/similarity.go for the full calibration note and
+// scripts/benchmark_skills/similarity.py for the per-pair justification.
+// MUST be mirrored on the pkg/skills side and vice versa.
+const nativeSimilarityThreshold = 0.0709
 
 // nativeStopwords is pkg/skills' stopwords set, copied verbatim (T-P2.04
 // calibration script parity) — see pkg/skills/similarity.go's comment: "The
@@ -175,7 +181,13 @@ type nativeSimilarityConflictError struct {
 }
 
 func (e *nativeSimilarityConflictError) Error() string {
-	return fmt.Sprintf("skills: external source active pair %q || %q scores %.4f above similarity threshold %.4f (T-P2.04 NON-SEPARABLE fallback, fp risk accepted) — refusing; drop or rename one description",
+	// HXC-159 F-17 (2026-09-23): mirrors pkg/skills.SimilarityConflictError's
+	// message fix — the "NON-SEPARABLE fallback" clause was a hardcoded
+	// calibration-outcome claim that drifts the moment the shared corpus is
+	// recalibrated (the current corpus IS separable; see
+	// scripts/benchmark_skills/threshold.json). MUST be kept byte-identical
+	// in shape to pkg/skills' message per this file's mirroring mandate.
+	return fmt.Sprintf("skills: external source active pair %q || %q scores %.4f above similarity threshold %.4f (see threshold.json for the current calibration) — refusing; drop or rename one description",
 		e.A, e.B, e.Score, e.Threshold)
 }
 
