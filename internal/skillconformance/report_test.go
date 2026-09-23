@@ -94,6 +94,48 @@ func TestGenerateReport_RealService_ValidatesClean(t *testing.T) {
 	}
 }
 
+// TestGenerateReport_QualifiedUsesDirectoryNotFrontMatterTitle is the
+// HXC-159 T-P9.01 finding F-11 RED-first regression guard. Every
+// pre-existing fixture in this file (and, before this test, in production)
+// happened to give a skill's directory name and its front-matter `name:`
+// field the SAME value — a coincidence that made the report's Qualified
+// field blind to whether it was genuinely keying on stable directory
+// identity or on arbitrary front-matter prose. This fixture DELIBERATELY
+// makes the two differ (directory "media-validator", front-matter title
+// "Media Validator (Human-Readable Title)") so this test can prove, not
+// assume, which one GenerateReport actually uses.
+//
+// Cross-consumer parity (D-1/FR-013) requires the STABLE, directory-based
+// identity: sibling consumer HelixCode's own report generator
+// (dev.helix.code/internal/skillconformance.GenerateReport) always keys on
+// the loader-supplied directory basename, never on front-matter prose —
+// see qualifiedIdentity's doc comment in report.go for the full citation.
+func TestGenerateReport_QualifiedUsesDirectoryNotFrontMatterTitle(t *testing.T) {
+	localDir := t.TempDir()
+	writeFixtureSkill(t, localDir, "media-validator",
+		"---\nname: Media Validator (Human-Readable Title)\ndescription: validates media\n---\nBody.\n")
+
+	cfg := skills.DefaultSkillConfig()
+	cfg.SkillsDirectory = localDir
+	cfg.EnableSemanticMatching = false
+	svc := skills.NewService(cfg)
+	if err := svc.Initialize(context.Background()); err != nil {
+		t.Fatalf("Initialize: %v", err)
+	}
+	authz := skills.NewSkillAuthorizer(svc)
+
+	m := GenerateReport(svc, authz, DirTierMap{Local: localDir})
+	if len(m.Skills) != 1 {
+		t.Fatalf("expected exactly one skill in the report, got %d: %+v", len(m.Skills), m.Skills)
+	}
+	got := m.Skills[0].Qualified
+	const want = "local.media-validator"
+	if got != want {
+		t.Fatalf("Qualified = %q, want %q — GenerateReport is keying on front-matter title %q instead of the stable directory-based identity (HXC-159 F-11)",
+			got, want, "Media Validator (Human-Readable Title)")
+	}
+}
+
 // TestGenerateReport_MalformedSkillIsVisibleNotFatal proves
 // malformed_skill_visibility=true against a REAL malformed fixture via
 // the REAL production LoadFromPath -> ParseDirectory path.

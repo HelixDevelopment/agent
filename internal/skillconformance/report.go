@@ -1,6 +1,7 @@
 package skillconformance
 
 import (
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,6 +39,46 @@ func trustForTier(tier string) string {
 	return "vendored"
 }
 
+// qualifiedIdentity derives the STABLE, directory-based local-identity
+// component of a skill's Qualified name (HXC-159 T-P9.01 finding F-11).
+//
+// s.Name comes straight from this skill's YAML front-matter `name:` field
+// (types.go: `Name string yaml:"name"`) — free-form prose a skill author
+// writes (e.g. "Media Validator"), NOT a stable identifier. Two problems
+// follow directly from using it as the cross-consumer comparison key: (1)
+// it is ABSENT for any skill whose SKILL.md carries no front-matter at all
+// (this package's own Parser treats that as valid — types.go/parser.go —
+// so s.Name is simply "" and Qualified degenerates to "<tier>."), and (2)
+// even when present, sibling consumer HelixCode's own report generator
+// (dev.helix.code/internal/skillconformance.GenerateReport) does NOT use
+// front-matter prose for its equivalent key — HelixCode's commands.Skill
+// name is ALWAYS the loader-supplied directory/filename basename
+// (helix_code/internal/commands/markdown_skills.go: parseSkillFile's name
+// parameter is populated from the directory walk, e.g. `name :=
+// entry.Name()`, never overridden by front-matter). Comparing HelixAgent's
+// front-matter-derived key against HelixCode's directory-derived key for
+// the SAME externally-installed skill directory therefore produces a
+// FALSE MISMATCH the moment the two front-ends parse that directory's
+// SKILL.md differently (missing front-matter, differing title casing,
+// etc.) — exactly the D-1/FR-013 violation F-11 reports.
+//
+// The fix: derive the SAME stable directory-based identity HelixCode
+// already uses — the basename of the directory containing the skill's
+// SKILL.md (filepath.Base(filepath.Dir(s.FilePath))) — so the two
+// consumers' reports key the SAME externally-installed skill identically
+// regardless of front-matter-parsing differences between their loaders.
+func qualifiedIdentity(s *skills.Skill) string {
+	if dirName := filepath.Base(filepath.Dir(s.FilePath)); dirName != "" && dirName != "." && dirName != string(filepath.Separator) {
+		return dirName
+	}
+	// FilePath absent or degenerate (e.g. a NewSkill-style in-memory
+	// construction with no real file path): fall back to the front-matter
+	// name rather than emitting an empty identity — an honest degradation,
+	// not a silent one, since a skill with neither a real file path nor a
+	// declared name has no stable identity to report at all.
+	return s.Name
+}
+
 // GenerateReport builds a CapabilityManifest from an ALREADY-LOADED
 // skills.Service and its SkillAuthorizer. Every loader_api_surface flag
 // below is set from a fact measured directly in internal/skills — see
@@ -52,7 +93,7 @@ func GenerateReport(svc *skills.Service, authz *skills.SkillAuthorizer, tiers Di
 			caps = []string{s.AllowedTools}
 		}
 		reports = append(reports, SkillReport{
-			Qualified:    tier + "." + s.Name,
+			Qualified:    tier + "." + qualifiedIdentity(s),
 			Source:       tier,
 			Trust:        trustForTier(tier),
 			Capabilities: caps,
