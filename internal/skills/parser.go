@@ -378,6 +378,25 @@ func (p *Parser) ParseDirectory(dir string) ([]*Skill, []ParseFailure, error) {
 				failures = append(failures, ParseFailure{Path: path, Error: parseErr.Error()})
 				return nil
 			}
+			// HXC-159 T-P9.01 F-16 (round-3 review fix): a SKILL.md with no
+			// YAML front-matter block (or a block without `name:`) parses
+			// "successfully" — splitFrontmatter is deliberately lenient about a
+			// missing "---" — but yields Skill.Name == "", and the Registry
+			// keys by Name, so registerSkillLocked drops it with zero
+			// operator-visible signal: never in GetAll(), never in
+			// LoadFailures(). Measured live 2026-09-23: 3 of the 8
+			// constitution/skills directories vanished this way. That is the
+			// same silent-failure class T-P6.04 closed for malformed YAML, so
+			// it is surfaced through the same load report here. Deriving an
+			// identity for a nameless skill (e.g. from its directory) is a
+			// separate design decision and is NOT made by this check.
+			if skill.Name == "" {
+				reason := "front-matter carries no name: (or no front-matter block at all) — an unnamed skill cannot be registered (Registry keys by name); add a YAML front-matter block with name: and description:"
+				logrus.WithField("path", path).
+					Warn("Skill file has no front-matter name — surfaced in load report, not silently dropped (HXC-159 F-16)")
+				failures = append(failures, ParseFailure{Path: path, Error: reason})
+				return nil
+			}
 			skills = append(skills, skill)
 		}
 
